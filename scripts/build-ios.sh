@@ -41,7 +41,8 @@ echo "==> 生成工程"
 cd "$IOS_DIR"
 xcodegen generate
 
-echo "==> 构建（模式: $MODE）"
+# 注意：变量必须用 ${} 包起来，否则紧跟的中文全角括号会被 bash 当作变量名的一部分
+echo "==> 构建（模式: ${MODE}）"
 if [ "$MODE" = "unsigned" ]; then
   xcodebuild \
     -project "$PROJECT" \
