@@ -13,6 +13,7 @@ struct SettingsView: View {
                 addressSection
                 accountSection
                 refreshSection
+                firmwareSection
                 statusSection
                 securitySection
             }
@@ -124,6 +125,51 @@ struct SettingsView: View {
             Text("刷新")
         } footer: {
             Text("前台轮询间隔。间隔越短越及时，也越费电。")
+        }
+    }
+
+    // MARK: 固件
+
+    @ViewBuilder
+    private var firmwareSection: some View {
+        Section {
+            InfoRow(
+                title: "当前版本",
+                value: model.firmware?.currentVersion
+                    ?? model.dashboard?.machine?.common?.systemVersion
+            )
+            InfoRow(title: "最新版本", value: model.firmware?.publishVersion)
+
+            HStack {
+                Text("更新状态")
+                    .font(.subheadline)
+                Spacer()
+                if let firmware = model.firmware {
+                    if firmware.hasUpdate {
+                        StatusBadge(text: "有新版本", tint: .orange)
+                    } else {
+                        StatusBadge(text: "已是最新", tint: .green)
+                    }
+                } else {
+                    Text("未获取")
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
+                }
+            }
+
+            Button {
+                Task { await model.refreshFirmware() }
+            } label: {
+                HStack(spacing: 8) {
+                    if model.isCheckingFirmware { ProgressView() }
+                    Text(model.isCheckingFirmware ? "检查中…" : "检查更新")
+                }
+            }
+            .disabled(model.isCheckingFirmware)
+        } header: {
+            Text("固件")
+        } footer: {
+            Text("只做版本提醒，升级请到 UGOS 网页端操作。")
         }
     }
 

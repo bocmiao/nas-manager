@@ -20,9 +20,12 @@ from .config import get_settings
 from .security import RateLimiter
 from .services.alerts import AlertEngine
 from .services.benchmark import BenchmarkManager
+from .services.history import HistoryRecorder
+from .services.images import ImageManager
 from .services.nas import NasService
 from .services.push import PushService
 from .services.snapshot import gather_snapshot
+from .services.snapshots import SnapshotService
 from .ugos.client import UgosAuthRequired, UgosClient, UgosError
 
 log = logging.getLogger("main")
@@ -51,6 +54,9 @@ async def lifespan(app: FastAPI):
     app.state.alerts = AlertEngine(settings)
     app.state.benchmark = BenchmarkManager(app.state.nas, settings)
     app.state.push = PushService(settings)
+    app.state.images = ImageManager(app.state.nas, settings)
+    app.state.snapshots = SnapshotService(app.state.nas, app.state.cache, settings)
+    app.state.history = HistoryRecorder(app.state.nas, settings)
     app.state.ugos_reachable = False
     app.state.last_poll_ok = False
     app.state.last_poll_at = 0
@@ -98,17 +104,22 @@ async def lifespan(app: FastAPI):
             await asyncio.sleep(max(10, settings.poll_interval))
 
     task = asyncio.create_task(poller())
+    hist_task = asyncio.create_task(app.state.history.run()) if settings.history_enabled else None
     log.info("中间层就绪 %s:%d  版本 %s", settings.server_host, settings.server_port, __version__)
 
     try:
         yield
     finally:
         task.cancel()
-        try:
-            await task
-        except asyncio.CancelledError:
-            pass
+        for t in (task, hist_task):
+            if t is None:
+                continue
+            try:
+                await t
+            except asyncio.CancelledError:
+                pass
         await app.state.benchmark.shutdown()
+        await app.state.images.shutdown()
         await app.state.push.close()
         await app.state.client.close()
         log.info("中间层已停止")

@@ -246,6 +246,19 @@ actor UgosClient {
         return try await perform(path: path, method: "POST", params: params, body: body)
     }
 
+    /// DELETE。部分接口要求把参数放 body（如快照删除），这里允许 json 为 nil。
+    func delete(
+        _ path: String,
+        json: [String: Any]? = nil,
+        params: [String: String] = [:]
+    ) async throws -> Any {
+        var body: Data?
+        if let json {
+            body = try JSONSerialization.data(withJSONObject: json)
+        }
+        return try await perform(path: path, method: "DELETE", params: params, body: body)
+    }
+
     /// 泛型便捷方法：把接口返回的 data 直接解码成模型。
     func getDecodable<T: Decodable>(
         _ type: T.Type, path: String, params: [String: String] = [:]

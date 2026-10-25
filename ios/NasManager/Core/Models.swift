@@ -43,9 +43,91 @@ struct MachineInfo: Decodable {
             let duplex: String?
         }
 
+        /// UPS。未接 UPS 时后端给 null，这里就整体为 nil，界面整块隐藏。
+        /// 字段名未逐项实测，按常见写法宽松抽取。
+        struct UPS: Decodable {
+            let model: String?
+            let status: Int?
+            /// 电量百分比
+            let battery: Int?
+            /// 剩余续航原始值，单位随固件（见 runtimeMinutes）
+            let runtime: Int?
+            let onBattery: Bool?
+
+            /// 剩余续航统一换算成分钟：多数固件给秒，小数值当分钟理解
+            var runtimeMinutes: Int? {
+                guard let runtime, runtime > 0 else { return nil }
+                return runtime >= 600 ? runtime / 60 : runtime
+            }
+
+            var batteryPercent: Int? {
+                guard let battery else { return nil }
+                return min(max(battery, 0), 100)
+            }
+
+            enum CodingKeys: String, CodingKey {
+                case model
+                case status
+                case battery
+                case batteryLevel = "battery_level"
+                case batteryPercentKey = "battery_percent"
+                case charge
+                case runtime
+                case remainTime = "remain_time"
+                case remainRuntime = "remain_runtime"
+                case batteryRuntime = "battery_runtime"
+                case onBattery = "on_battery"
+                case usingBattery = "using_battery"
+                case powerSupply = "power_supply"
+            }
+
+            init(from decoder: Decoder) throws {
+                let container = try decoder.container(keyedBy: CodingKeys.self)
+                model = try? container.decode(String.self, forKey: .model)
+                status = UPS.int(container, keys: [.status])
+                battery = UPS.int(container, keys: [.battery, .batteryLevel, .batteryPercentKey, .charge])
+                runtime = UPS.int(container, keys: [.runtime, .remainTime, .remainRuntime, .batteryRuntime])
+                onBattery = UPS.bool(container, keys: [.onBattery, .usingBattery, .powerSupply])
+            }
+
+            private static func int(
+                _ container: KeyedDecodingContainer<CodingKeys>,
+                keys: [CodingKeys]
+            ) -> Int? {
+                for key in keys {
+                    if let value = try? container.decode(Int.self, forKey: key) { return value }
+                    if let value = try? container.decode(Double.self, forKey: key) { return Int(value) }
+                    if let text = try? container.decode(String.self, forKey: key) {
+                        let digits = text.prefix { $0.isNumber || $0 == "-" }
+                        if let value = Int(digits) { return value }
+                    }
+                }
+                return nil
+            }
+
+            private static func bool(
+                _ container: KeyedDecodingContainer<CodingKeys>,
+                keys: [CodingKeys]
+            ) -> Bool? {
+                for key in keys {
+                    if let value = try? container.decode(Bool.self, forKey: key) { return value }
+                    if let value = try? container.decode(Int.self, forKey: key) { return value != 0 }
+                    if let text = try? container.decode(String.self, forKey: key) {
+                        switch text.lowercased() {
+                        case "true", "1", "yes", "battery", "on": return true
+                        case "false", "0", "no", "ac", "line", "off": return false
+                        default: continue
+                        }
+                    }
+                }
+                return nil
+            }
+        }
+
         let cpu: [CPU]?
         let mem: [Memory]?
         let net: [Net]?
+        let ups: UPS?
     }
 
     let common: Common?

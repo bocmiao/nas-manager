@@ -6,8 +6,11 @@ from fastapi import Request
 from ..security import verify_token
 from ..services.alerts import AlertEngine
 from ..services.benchmark import BenchmarkManager
+from ..services.history import HistoryRecorder
+from ..services.images import ImageManager
 from ..services.nas import NasService
 from ..services.push import PushService
+from ..services.snapshots import SnapshotService
 
 
 def require_auth(request: Request) -> None:
@@ -28,3 +31,15 @@ def get_benchmark(request: Request) -> BenchmarkManager:
 
 def get_push(request: Request) -> PushService:
     return request.app.state.push
+
+
+def get_images(request: Request) -> ImageManager:
+    return request.app.state.images
+
+
+def get_snapshots(request: Request) -> SnapshotService:
+    return request.app.state.snapshots
+
+
+def get_history(request: Request) -> HistoryRecorder:
+    return request.app.state.history

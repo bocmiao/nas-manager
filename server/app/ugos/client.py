@@ -209,6 +209,26 @@ class UgosClient:
             return await self.post(path, body, params, retry=False, headers=headers)
         raise UgosError(code, data.get("msg") or "", path, data.get("debug") or "")
 
+    async def delete(self, path: str, body: dict | None = None, params: dict | None = None,
+                     *, retry: bool = True, headers: dict | None = None):
+        """DELETE 也走 `?token=`，请求体允许 JSON（httpx 的 delete 快捷方法不支持 body）。"""
+        token = await self._ensure_token()
+        q = dict(params or {})
+        q["token"] = token
+        r = await self._http.request(
+            "DELETE", self._url(path), json=body or {}, params=q, headers=headers
+        )
+        data = self._parse(r, path)
+
+        code = data.get("code")
+        if code == 200:
+            return data.get("data")
+        if code in AUTH_FAIL_CODES and retry:
+            log.warning("会话失效 code=%s，重新登录后重试 %s", code, path)
+            await self._relogin()
+            return await self.delete(path, body, params, retry=False, headers=headers)
+        raise UgosError(code, data.get("msg") or "", path, data.get("debug") or "")
+
     async def post_privileged(self, path: str, body: dict | None = None):
         """需要二级密码确认的写操作：自动附带 X-CurPass-Token。"""
         tok = await self.password_token()

@@ -65,6 +65,18 @@ class Settings(BaseSettings):
     # 测速属写盘操作，默认关闭；开启后接口才允许真正发起测试
     benchmark_allow_start: bool = True
 
+    # --- 镜像拉取 ---
+    # UGOS 只在镜像列表里暴露“拉取中/已完成”状态，没有字节级进度，只能轮询
+    image_pull_poll_seconds: float = 3.0
+    image_pull_timeout_seconds: int = 1800
+    # 拉取会占用网络与磁盘，默认开启但可一键关闭
+    image_allow_pull: bool = True
+
+    # --- 历史采样（内存环形缓冲，重启即清空）---
+    history_enabled: bool = True
+    history_interval: int = 60      # 采样间隔（秒）
+    history_points: int = 360       # 每个指标保留点数，360 × 60s = 6 小时
+
     # --- APNs 推送 ---
     # 全部留空时推送通道降级为「只写日志」，不影响服务启动
     apns_key_file: str = ""          # .p8 私钥路径

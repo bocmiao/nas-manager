@@ -16,6 +16,7 @@ struct ContainersView: View {
     @State private var logTarget: Container?
     @State private var busyId: String?
     @State private var actionError: String?
+    @State private var showingImages = false
 
     var body: some View {
         NavigationStack {
@@ -56,11 +57,21 @@ struct ContainersView: View {
             .toolbar {
                 ToolbarItem(placement: .topBarTrailing) {
                     Button {
+                        showingImages = true
+                    } label: {
+                        Image(systemName: "square.stack.3d.down.right")
+                    }
+                }
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button {
                         Task { await model.reloadContainers() }
                     } label: {
                         Image(systemName: "arrow.clockwise")
                     }
                 }
+            }
+            .navigationDestination(isPresented: $showingImages) {
+                ImagesView(model: model)
             }
             .sheet(item: $logTarget) { container in
                 ContainerLogSheet(model: model, container: container)

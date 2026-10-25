@@ -11,6 +11,7 @@ struct StorageView: View {
             List {
                 poolSection
                 volumeSection
+                snapshotSection
                 diskSection
 
                 if let error = model.errorMessage {
@@ -117,6 +118,20 @@ struct StorageView: View {
             Text("卷与分区")
         } footer: {
             Text("UGOS 上每个卷对应存储池里的一个文件系统分区，挂载点即该分区在系统中的路径。")
+        }
+    }
+
+    // MARK: 快照入口
+
+    private var snapshotSection: some View {
+        Section {
+            NavigationLink {
+                SnapshotsView(model: model)
+            } label: {
+                Label("快照管理", systemImage: "clock.arrow.circlepath")
+            }
+        } footer: {
+            Text("快照依赖固件开放对应接口，进入后会自动探测。")
         }
     }
 

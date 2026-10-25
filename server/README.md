@@ -67,6 +67,10 @@ Authorization: Bearer <API_TOKEN>
 | GET | `/api/v1/system` | 硬件与固件详情（含 UPS、网口协商速率） |
 | GET | `/api/v1/live` | 实时监控（2 秒缓存） |
 | GET | `/api/v1/storage` | 磁盘 / 存储池 / 卷 |
+| GET | `/api/v1/firmware` | **固件版本查询**：当前版本 / 可用新版本 / 是否有更新（只读，不含升级） |
+| GET | `/api/v1/ups` | **UPS 状态**：未接时返回 `supported: false` |
+| GET | `/api/v1/history?metric=cpu&points=120` | **历史曲线**（内存环形缓冲，60s 一点 / 6 小时） |
+| GET | `/api/v1/history/metrics` | 可用指标清单与缓冲状态（`since` / `samples` / `last_error`） |
 
 ### 存储 · SMART / 测速
 
@@ -87,9 +91,34 @@ Authorization: Bearer <API_TOKEN>
 | 方法 | 路径 | 说明 |
 |---|---|---|
 | GET | `/api/v1/containers` | 容器列表（含 `restarting` / cpu / mem / 端口映射） |
+| GET | `/api/v1/containers/{id}/detail` | **容器详情**：环境变量 / 端口映射 / 卷 / 网络 / 资源限制（`compose` 恒为不可用） |
 | POST | `/api/v1/containers/{id}/{action}` | action = `start` / `stop` / `restart` |
 | GET | `/api/v1/containers/{id}/logs?tail=200&keyword=` | **容器日志**，已解 Docker 多路复用帧 |
 | GET | `/api/v1/docker/usage` | **Docker 资源占用**：引擎状态 + 每容器 CPU/内存/网络 |
+
+### Docker 镜像
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| GET | `/api/v1/docker/images` | **镜像列表**：标签 / 大小 / 创建时间 / 被哪些容器引用 |
+| DELETE | `/api/v1/docker/images?ids=a&ids=b` | **删除镜像**，1 个走单个接口、多个自动走批量接口。`ids` 可用 `sha256:…` / `name:tag` / 镜像名 |
+| POST | `/api/v1/docker/images/pull` | **拉取镜像**，202 + 任务对象，body `{"name":"nginx","tag":"latest"}` |
+| GET | `/api/v1/docker/images/pull?ref=nginx:latest` | 查拉取任务状态与进度 |
+| GET | `/api/v1/docker/images/pulls` | 本进程发起的所有拉取任务 |
+
+### 快照
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| GET | `/api/v1/snapshots` | **快照总览**：能力判定、卷文件系统、各类型的快照文件夹 |
+| GET | `/api/v1/snapshots/{folder_type}` | 某类型的快照文件夹，`folder_type` = `share` \| `home` |
+| GET | `/api/v1/snapshots/{folder_type}/{folder_id}?page=1&size=50` | 该文件夹的快照列表 |
+| GET | `/api/v1/snapshots/{folder_type}/{folder_id}/schedule` | 快照计划 + 保留策略（只读） |
+| POST | `/api/v1/snapshots/{folder_type}/{folder_id}` | 立即创建快照，body `{"comment": "..."}` 可空 |
+| DELETE | `/api/v1/snapshots/{folder_type}/{folder_id}?names=a&names=b` | 删除快照（批量） |
+| POST | `/api/v1/snapshots/{folder_type}/{folder_id}/restore` | **回滚**，body 必须带 `{"name":"<快照名>","confirm":"ROLLBACK"}` |
+
+> 回滚会覆盖当前数据且不可撤销，`confirm` 不等于 `ROLLBACK` 一律 400 拒绝，不会默认执行。
 
 ### 任务管理器
 
@@ -160,6 +189,59 @@ Authorization: Bearer <API_TOKEN>
   `cpuUsagePercentage` / `memoryUsagePercentage`（实为字节）/ `upstreamTraffic` / `downstreamTraffic`。
 - 该接口**只返回运行中的容器**（本机 16 个容器里返回 9 个）。需要全量请配合 `/containers`。
 - `net_*_bytes` 是累计字节数，不是速率。
+
+## 镜像管理
+
+- 端点全部是 **POST**：`ShowLocalImageV2`（本地镜像）、`ObtainAllImages`（Docker Hub 商店搜索，
+  与本地无关）、`DeleteImage` / `BatchDeleteImage`、`DownloadImage`。用 GET 访问一律 `9405`。
+- **拉取没有字节级进度**。UGOS 的做法是：拉取期间镜像列表里出现一条
+  `<name>:<tag>:pull`、`status=2` 的临时条目，完成后变成 `status=1` 并带上真实 `imageSize`。
+  `progress` 字段实测恒为 0，所以中间层只能报「进行中 / 完成 / 失败」，不编造百分比。
+- 中间层把拉取包成异步任务：`POST /docker/images/pull` 立刻返回 202，后台每 3 秒轮询一次列表，
+  客户端轮询 `GET /docker/images/pull?ref=` 拿状态。镜像已存在时直接返回 `succeeded` 并注明未重复拉取。
+- **删除要自己校验存在性**：UGOS 对不存在的镜像同样返回 `successful`，所以中间层先列一次做校验，
+  响应里 `deleted` / `missing` 分列。`BatchDeleteImage` 的 `imageIds` 必须是**对象数组**
+  （`{id,status,imageName,imageVersion}`），传字符串数组会报 `cannot unmarshal string ...`。
+- 「关联容器数」用 `QueryAllContaners`（body `{"list":[{imageId,imageRef}]}`）一次批量查，
+  返回 `{result:[{imageId,names:[容器名]}]}`；没有容器引用时返回 `{}`。
+
+## 快照
+
+「快照」是独立的 `com.ugreen.snapshot` 应用（entry `/snapshot`），**不在存储管理里** ——
+storagemgr 的 bundle 里只有 `snapshot_size` 这种空间占用字段，没有任何快照接口。
+
+- 快照以「文件夹」为粒度：`folder_type` 只有 `share`（共享文件夹）与 `home`（家目录）。
+- 列表接口 `v1/snapshot/snapshot` 与文件夹接口都强制要求 `page_number` / `page_size`，
+  缺了返回 `9999` + `limit is 0, offset: 0, limit: 0`。
+- **只支持 Btrfs**：本机 volume1 是 ext4，创建/回滚直接被拒
+  （`9999` + `folderServ.GetBaseFolder(): mnt point of home is not btrfs filesystem`），
+  列表返回 `32003 文件夹不存在`。中间层把这些错误翻成 `supported:false` + `reason`。
+- 删除接口对不存在的快照也返回 `success`，所以响应里带 `verified`：只有重新列到列表才能确认真的删掉了。
+- 中间层不提供「修改快照计划」的写接口，避免误改用户备份策略；`schedule` 只读。
+
+## 固件检查
+
+- `firmware/status` 的 `current_version` 是字符串（`1.19.1.0126`），
+  `firmware/version/is_new` 里同名字段是整数（`119010126`），**不能混用**。
+- 中间层只做查询：`current_version` / `latest_version` / `has_update` / `size_bytes` / `notes`（更新说明）。
+- `state`、`operate_type`（本机 2 / 5）语义未确认，原样透出，不做猜测性解释。
+- **不实现升级动作**：固件升级不可逆，App 端只做提醒。
+
+## UPS
+
+- `sysinfo/machine/common` 的 `hardware.ups` 在未接 UPS 时恒为 `null` → `supported:false, connected:false`。
+- 已接时按常见命名多键兜底取 `battery_percent` / `runtime_seconds` / `on_battery` / `events`，
+  同时整包透出 `raw`，并标 `verified:false`（本机无法验证字段名）。
+
+## 历史采样
+
+- 进程内环形缓冲，默认 **60 秒一采、每指标 360 点（6 小时）**，
+  可用 `HISTORY_INTERVAL` / `HISTORY_POINTS` / `HISTORY_ENABLED` 调整。
+- 指标：`cpu` / `mem` / `cpu_temp` / `fan`（机箱风扇 RPM）/ `net_tx` / `net_rx` / `disk_temp`（按盘）。
+- 查询：`/history?metric=cpu&points=120`，返回 `{metric, unit, since, interval, stale, points:[{ts,v}]}`。
+  `disk_temp` 不带 `disk` 时返回所有盘的序列，带 `disk=硬盘1` 时只返回该盘。
+- **重启即清空**：`since` 是缓冲里最早一个点的真实时间戳，不是固定「6 小时前」，客户端按它画起点。
+  `stale=true` 表示超过 3 个采样周期没有新点（采样协程卡住或 NAS 不可达）。
 
 ## 任务管理器
 
@@ -310,9 +392,9 @@ APNs 私钥请挂载进容器并设置 `APNS_KEY_FILE`，不要把 `.p8` 打进�
 1. **磁盘测速在在用磁盘上跑不了** —— 测试机两块盘都在 RAID0 存储池里，NAS 直接拒绝
    （`9999 / disk is busy: 1`）。接口、密码令牌、异步任务框架都已打通并实测，
    但「测速跑完拿到 MB/s 数字」这一步需要一块空闲盘才能验证。
-2. **UPS 字段未经真机验证** —— 本机未接 UPS，`sysinfo/machine/common` 的 `hardware.ups` 恒为 `null`。
-   `_check_ups` 按常见命名做多路兜底（`on_battery` / `power_status` / `status` 等），
-   取不到就**不告警**（宁漏勿错）。接上 UPS 后需要用真实返回校准一次。
+2. **UPS 字段未经真机验证** —— 本机未接 UPS，`sysinfo/machine/common` 的 `hardware.ups` 恒为 `null`，
+   `/api/v1/ups` 因此固定返回 `supported:false`。已接 UPS 的分支按常见命名做多路兜底
+   （`battery_charge` / `runtime` / `on_battery` 等）并标 `verified:false`，接上真实 UPS 后需校准一次。
 3. **`volume.read_rate` / `write_rate` 单位存疑** —— 实测出现过 `1.08e12` 量级，
    怀疑是采样窗口内的累计字节数而非 B/s。App 端请做平滑或裁剪。
 4. **容器日志无法区分 stdout / stderr** —— 解帧后流类型已丢失，`stream` 参数未启用。
@@ -323,3 +405,13 @@ APNs 私钥请挂载进容器并设置 `APNS_KEY_FILE`，不要把 `.p8` 打进�
    JWT 结构、ES256 签名、HTTP/2 链路、请求头均已在本地验签 + 真实打到 Apple 端点确认。
 9. 磁盘 `status` 语义：`0` 与 `1` 均为正常（`1` = 已激活在用），其余才告警。
 10. `v1/idx/info` 在本机返回 `8003`，属该接口自身问题，与认证无关。
+11. **容器 compose 内容拿不到** —— UGOS Docker 应用的 87 个端点里没有任何 compose / project / yaml
+    读取接口，`GetContainerById` 只给 `projectName`。compose 文件只以普通文件形式存在 NAS 磁盘上
+    （如 `/volume1/@appstore/<app>/...`），要读只能走文件管理接口。`/containers/{id}/detail` 里
+    `compose.available` 恒为 `false` 并附原因，环境变量 / 端口映射 / 卷 / 网络均可正常返回。
+12. **快照在本机整体不可用** —— volume1 是 ext4，UGOS 快照只支持 Btrfs。
+    接口（列表 / 创建 / 删除 / 回滚 / 计划）全部打通并实测到「NAS 明确拒绝」这一步，
+    但「真的创建出一个快照」需要 Btrfs 卷才能验证。`/api/v1/snapshots` 会返回 `supported:false` + `reason`。
+13. **镜像拉取没有百分比进度** —— 服务端 `progress` 恒为 0，只能靠 `status`（2=拉取中，1=完成）判断阶段；
+    拉取完成后才有真实 `imageSize`。中间层不编造进度数字。
+14. **历史曲线只在内存里** —— 进程重启即清空，最长 6 小时；需要长周期趋势得自己落盘或接外部 TSDB。

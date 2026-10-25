@@ -50,17 +50,29 @@ final class AppModel {
     var activeDisplay: String?
     var certificateWarning: CertificateWarning?
     var notificationDenied = false
+    /// 固件版本提醒（只读，不做任何升级动作）
+    var firmware: FirmwareInfo?
+    var isCheckingFirmware = false
 
     let alerts = AlertCenter()
+    /// 本地历史采样，供总览页曲线使用
+    let metrics = MetricsHistory()
 
     private var client: UgosClient?
     private var docker: DockerService?
     private var storage: StorageService?
+    private var imageService: ImageService?
+    private var snapshotService: SnapshotService?
+    private var firmwareService: FirmwareService?
     private var pollTask: Task<Void, Never>?
     private var evaluator = AlertEvaluator()
     private var activeHost: String?
     private var consecutiveFailures = 0
     private var lastSwitchAttempt = Date.distantPast
+    private var lastFirmwareCheck = Date.distantPast
+
+    /// 最近一次拉到的可快照文件夹，创建快照时作为目标候选
+    var snapshotFolders: [SnapshotFolder] = []
 
     init() {
         let defaults = UserDefaults.standard
@@ -133,6 +145,9 @@ final class AppModel {
         client = newClient
         docker = DockerService(client: newClient)
         storage = StorageService(client: newClient)
+        imageService = ImageService(client: newClient)
+        snapshotService = SnapshotService(client: newClient)
+        firmwareService = FirmwareService(client: newClient)
         activeLabel = candidate.label
         activeDisplay = endpoint.displayName
         activeHost = endpoint.host
@@ -164,6 +179,9 @@ final class AppModel {
         client = nil
         docker = nil
         storage = nil
+        imageService = nil
+        snapshotService = nil
+        firmwareService = nil
         dashboard = nil
         lastUpdated = nil
         activeLabel = nil
@@ -171,6 +189,8 @@ final class AppModel {
         activeHost = nil
         errorMessage = nil
         certificateWarning = nil
+        firmware = nil
+        lastFirmwareCheck = Date.distantPast
         consecutiveFailures = 0
         evaluator = AlertEvaluator()
     }
@@ -225,7 +245,11 @@ final class AppModel {
         dashboard = result
         lastUpdated = Date()
         errorMessage = nil
+        if let live = result.live {
+            metrics.record(live: live)
+        }
         processAlerts(result)
+        await loadFirmwareIfNeeded()
     }
 
     /// 内网/公网互换：只在配了两个地址、且距上次切换超过 1 分钟时执行
@@ -248,6 +272,9 @@ final class AppModel {
             client = newClient
             docker = DockerService(client: newClient)
             storage = StorageService(client: newClient)
+            imageService = ImageService(client: newClient)
+            snapshotService = SnapshotService(client: newClient)
+            firmwareService = FirmwareService(client: newClient)
             activeLabel = alternate.label
             activeDisplay = alternate.endpoint.displayName
             activeHost = alternate.endpoint.host
@@ -326,6 +353,85 @@ final class AppModel {
     func smartInfo(for disk: Disk) async throws -> SMARTInfo {
         guard let storage = storage else { throw UgosError.auth("尚未连接") }
         return try await storage.smartInfo(for: disk)
+    }
+
+    // MARK: 镜像
+
+    @MainActor
+    func images() async throws -> [DockerImage] {
+        guard let imageService = imageService else { throw UgosError.auth("尚未连接") }
+        return try await imageService.list()
+    }
+
+    @MainActor
+    func deleteImage(_ image: DockerImage) async throws {
+        guard let imageService = imageService else { throw UgosError.auth("尚未连接") }
+        try await imageService.delete(image)
+    }
+
+    @MainActor
+    func pullImage(_ reference: String) async throws {
+        guard let imageService = imageService else { throw UgosError.auth("尚未连接") }
+        try await imageService.pull(reference)
+    }
+
+    // MARK: 快照
+
+    /// 快照接口是否可用由服务层探测决定，这里原样透传结果
+    @MainActor
+    func snapshots() async -> SnapshotQueryResult {
+        guard let snapshotService = snapshotService else {
+            return SnapshotQueryResult(items: [], folders: [], available: false, message: "尚未连接", endpoint: nil)
+        }
+        let result = await snapshotService.list()
+        snapshotFolders = result.folders
+        return result
+    }
+
+    @MainActor
+    func createSnapshot(volume: String, remark: String) async throws {
+        guard let snapshotService = snapshotService else { throw UgosError.auth("尚未连接") }
+        // 没有缓存的文件夹列表时先拉一次，避免创建时选不到目标
+        if snapshotFolders.isEmpty {
+            let result = await snapshotService.list()
+            snapshotFolders = result.folders
+            guard result.available else {
+                throw UgosError.auth(result.message ?? "该存储不支持快照")
+            }
+        }
+        try await snapshotService.create(volumeName: volume, remark: remark, folders: snapshotFolders)
+    }
+
+    @MainActor
+    func deleteSnapshot(_ item: SnapshotItem) async throws {
+        guard let snapshotService = snapshotService else { throw UgosError.auth("尚未连接") }
+        try await snapshotService.delete(item)
+    }
+
+    /// 回滚到指定快照，覆盖当前数据且不可撤销
+    @MainActor
+    func rollbackSnapshot(_ item: SnapshotItem) async throws {
+        guard let snapshotService = snapshotService else { throw UgosError.auth("尚未连接") }
+        try await snapshotService.restore(item)
+    }
+
+    // MARK: 固件
+
+    @MainActor
+    func refreshFirmware() async {
+        guard let firmwareService = firmwareService else { return }
+        isCheckingFirmware = true
+        defer { isCheckingFirmware = false }
+        let fallback = dashboard?.machine?.common?.systemVersion
+        firmware = await firmwareService.info(fallbackVersion: fallback)
+        lastFirmwareCheck = Date()
+    }
+
+    /// 轮询里最多 10 分钟查一次，避免每 30 秒打一次固件接口
+    @MainActor
+    private func loadFirmwareIfNeeded() async {
+        guard Date().timeIntervalSince(lastFirmwareCheck) >= 600 else { return }
+        await refreshFirmware()
     }
 
     // MARK: 告警

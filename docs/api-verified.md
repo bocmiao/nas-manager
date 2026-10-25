@@ -3,7 +3,7 @@
 > 设备：UGREEN DXP4800 Plus
 > 固件：**UGOS Pro 1.19.1.0126**（Web 前端 1.19.0.78471，build 2026-08-19）
 > 局域网：`https://<NAS 地址>:9443`（自签证书 CN/ORG = `UGREEN`）
-> 验证时间：2026-10-25
+> 验证时间：2026-10-25 首次；2026-10-26 复测并补齐镜像 / 快照 / 固件 / UPS / 容器详情
 > ⚠️ 本文件含接口事实，不含任何凭据。
 
 ---
@@ -112,9 +112,13 @@ X-CurPass-Token: <RSA 加密后的账号密码>
 | 1010 | Token 为空或格式非法 |
 | 1024 | 会话过期，需重登 |
 | 1101 | 写操作密码验证失败（缺/错 `X-CurPass-Token`） |
+| 1300 | 没有权限访问（快照数据域，本机对任意 path 均如此） |
+| 1301 | 不允许访问（`filemgr/getDirFileList` 参数不完整时常见） |
+| 2052 | 镜像名含非法字符（`DownloadImage` 字段名不对时也报这个） |
 | 5001 | 硬盘不存在（SMART/测速的 `disk` 参数值不对） |
-| 9404 | 客户端版本/通道不匹配（POST 带 token 时常出现） |
-| 9405 | 应用未安装或无权限 |
+| 9404 | **模块内路由不存在**（storage 等模块的兜底码，见踩坑 19） |
+| 9405 | 接口存在但**请求方法不对**（镜像模块只吃 POST，用 GET 即此码） |
+| 32003 | 快照文件夹不存在 |
 | 9999 | 服务端操作失败（含参数校验，`debug` 字段有详情） |
 | 8003 | 数据库操作失败 |
 
@@ -136,6 +140,24 @@ X-CurPass-Token: <RSA 加密后的账号密码>
 | GET | `v1/user/current/user` | 当前用户 uid、昵称、账号类型、OTP 信息 |
 | GET | `v1/user/config` | 用户偏好（温度单位、壁纸、组件显示） |
 | GET | `v1/time/config` | 时区、时间设置、格式 |
+
+**固件两个接口的字段实测（2026-10-26 复测）**
+
+| 来源 | 字段 | 示例值 | 说明 |
+|---|---|---|---|
+| `firmware/status` | `current_version` | `1.19.1.0126` | **字符串**形态的当前版本 |
+| `firmware/status` | `remote_base.versionName` | `1.20.0.0142` | 可升级到的新版本（字符串） |
+| `firmware/status` | `remote_base.versionNo` | `120000142` | 同上，整数形态 |
+| `firmware/status` | `remote_base.size` | `1303473152` | 新固件体积（字节） |
+| `firmware/status` | `remote_base.desc` | 多行文本 | 更新说明（中文）；英文在 `firmwareRelationList` |
+| `firmware/status` | `running` | `false` | 是否正在升级/检查 |
+| `firmware/status` | `current_stat` / `operate_type` | `2` / `5` | **语义未确认**，不可当作"有新版本"的判据 |
+| `version/is_new` | `current_version` | `119010126` | **整数**形态（同一版本号，别和上面混用） |
+| `version/is_new` | `publish_version` | `120000142` | 整数形态的最新版本 |
+| `version/is_new` | `has_version` | `true` | **唯一可靠的"有更新"判据** |
+
+**UPS**：`sysinfo/machine/common` → `hardware.ups`，未接 UPS 时恒为 `null`（本机实测一直为 `null`）。
+已接形态**无法在本机验证**，字段名未知。
 
 ### 实时监控（**总览页核心**）
 
@@ -167,6 +189,37 @@ X-CurPass-Token: <RSA 加密后的账号密码>
 | GET | `v1/storage/disk/ihm/info?disk=/dev/sda` | 硬盘健康分析（IHM），本机 `report_code=4`（未启用） |
 | GET | `v1/storage/disk/position` | 点亮盘位灯定位硬盘 |
 
+### 快照（`com.ugreen.snapshot` 应用，entry `/snapshot`）
+
+> 探索过程见 §四 踩坑 20~22。快照**不在**存储管理应用里，是独立应用。
+
+| 方法 | 路径 | 参数 | 返回要点 |
+|---|---|---|---|
+| GET | `v1/snapshot/folder/{folder_type}` | query `page_number` / `page_size`（**必传**） | `{"folders":[],"total_number":0}`；本机 `share` 与 `home` 都为空 |
+| GET | `v1/snapshot/folder/{folder_type}/settings/{folder_id}` | — | `snapshot_schedule`（frequency/interval_type/start_runtime…）+ `retention_policy`（by_day/by_number） |
+| POST | `v1/snapshot/folder/{folder_type}/settings/{folder_id}` | 同上的两个对象 | 改计划；`interval_type` 不合法时报 `9999 unknown request IntervalType: 0` |
+| GET | `v1/snapshot/snapshot` | query `folder_type` + `folder_id` + `page_number` + `page_size` | 某文件夹的快照列表；文件夹不存在 → `32003` |
+| POST | `v1/snapshot/snapshot` | `{"folder_type":"home","folder_id":1}` | **创建快照**；非 Btrfs → `9999` + `mnt point of home is not btrfs filesystem` |
+| DELETE | `v1/snapshot/snapshot` | `{"folder_type":…,"folder_id":…,"snapshots":["<名字>"]}` | **删除快照**；对不存在的快照也返回 `code 200 success`（幂等，无法据此判断） |
+| POST | `v1/snapshot/snapshot/restore` | `{"folder_type":…,"folder_id":…,"snapshot":"<名字>"}` | **回滚**；同样先校验文件系统，本机报 not btrfs |
+| GET | `v1/snapshot/preference/web_settings` | — | 快照文件浏览器的排序/视图偏好 |
+| POST | `v1/snapshot/data/getDirFileList` | `{"limit":50,"page":1,"sort_type":1,"reverse":false,"path":"/@"}` | 浏览快照内文件；本机任意 path 均 `1300 没有权限访问` |
+| GET | `v1/snapshot/data/getActionType` | — | `{"result":4}`（含义未知） |
+
+**关键实测结论**
+
+- `folder_type` 只接受 `share` 与 `home`；传 `volume` / `user` / `all` 返回 `9999 unknown folder type: x`。
+- 缺少分页参数时错误是 `9999 操作失败!` + `debug="limit is 0, offset: 0, limit: 0"`，
+  即便 query 里已经带了 `limit` / `offset` 也一样 —— 服务端读的是 `page_number` / `page_size`。
+- 本机 volume1 是 **ext4**，快照全链路被文件系统挡住：
+  - 列表 → `32003 文件夹不存在`
+  - 创建 / 回滚 → `9999 folderServ.GetBaseFolder(): mnt point of home is not btrfs filesystem`
+  - 删除 → `200 success`（空转）
+- `v1/snapshot/folder/{type}/settings/{id}` 对任意 `folder_id` 都返回同一份默认值，**不做存在性校验**。
+- `DELETE v1/snapshot/snapshot` **连 folder 都不校验**：`folder_type=share` + 不存在的 `folder_id`
+  同样 `200 success`。因此删除结果的唯一判据是"删完再列一次"，别信返回码。
+- 这些写操作**都不需要** `X-CurPass-Token`（与磁盘测速不同）。
+
 ### 日志
 
 | 方法 | 路径 | 返回要点 |
@@ -186,11 +239,44 @@ X-CurPass-Token: <RSA 加密后的账号密码>
 | POST | `v1/docker/container/ShowContainerDetailListV2` | **按容器的资源**：`cpuUsage` / `memUsage` / `upstreamTraffic` / `downstreamTraffic` / `restarting`，必传 `PageNum` |
 | GET | `v1/docker/view/ObtainOverviewInfo` | **Docker 总览**：引擎统计 + `overviewContainers[]`（仅运行中） |
 | GET | `v1/docker/view/GetEngineStatus` | `{"result": "online"}` |
-| GET | `v1/docker/container/GetContainerById?containerId=<id>` | 容器详情（环境变量、网络、端口、限制） |
+| GET | `v1/docker/container/GetContainerById?containerId=<id>` | 容器详情（环境变量、网络、端口、限制），详见下方 |
 | GET | `v1/docker/container/ShowCpu` / `ShowMemory` | **宿主机级** CPU/内存，非容器级（传 containerId 无效） |
 | — | `v1/docker/container/AddTerminal` / `DelTerminal` | **容器内终端** |
-| — | `v1/docker/image/ObtainAllImages` / `ShowLocalImageV2` / `DeleteImage` / `DownloadImage` | 镜像管理 |
 | — | `v1/docker/view/GetEngineStatus` / `GetRegistryMirrors` / `SetRegistryMirrors` | Docker 引擎与镜像加速配置 |
+
+#### 镜像（全部 POST，GET 返回 9405）
+
+| 方法 | 路径 | 参数 / body | 返回要点 |
+|---|---|---|---|
+| POST | `v1/docker/image/ShowLocalImageV2` | `{"PageNum":1,"PageSize":100}`（实测可选，默认 50/页） | **本地镜像**：`originalTotal` + `result[]`，字段见下 |
+| POST | `v1/docker/image/ObtainAllImages` | `{"PageNum":1,"PageSize":50}` | **Docker Hub 商店搜索**（本机 1165 条），与本地镜像无关 |
+| POST | `v1/docker/image/QueryAllContaners` | `{"list":[{"imageId":"sha256:…","imageRef":"alpine:latest"}]}` | `{result:[{imageId,imageName,imageVersion,names:["容器名"]}]}`；未被引用返回 `{}` |
+| POST | `v1/docker/image/DeleteImage` | `{"id":"<imageId>","status":1,"imageName":"alpine","imageVersion":"latest"}` | `{"result":"successful"}`，**不存在的镜像也返回 successful** |
+| POST | `v1/docker/image/BatchDeleteImage` | `{"imageIds":[{"id":…,"status":…,"imageName":…,"imageVersion":…}]}` | 同上；`imageIds` 传字符串数组会报 `cannot unmarshal string into Go struct field` |
+| POST | `v1/docker/image/DownloadImage` | `{"name":"hello-world","version":"latest"}` | `{"result":"successful"}` 立刻返回；字段名是 **name/version**，不是 imageName/imageVersion（后者报 `2052 镜像名存在特殊字符`） |
+
+`ShowLocalImageV2` 的 `result[]` 字段：
+`imageId`（`sha256:` 前缀）、`imageRef`（`name:tag`）、`imageName`、`imageVersion`（tag）、
+`imageSize`（字节）、`create`（**Unix 秒**）、`status`（1=可用，2=拉取中）、`progress`（实测恒 0）、
+`pullErr`（失败原因）、`imageDescribe`、`linkUrl`、`imageStatusSign`、`archType`。
+
+**拉取过程（实测）**：`DownloadImage` 返回后，列表里先出现 `imageRef="<name>:<tag>:pull"`、`status=2`，
+结束后条目变成 `name:tag`、`status=1` 并带上真实 `imageSize`。没有字节级进度可用。
+
+#### 容器详情 `GetContainerById`
+
+| 字段 | 说明 |
+|---|---|
+| `containerName` / `imageName` / `imageId` / `tag` / `imageVersion` | 身份 |
+| `projectName` | 所属应用（compose 项目名），**没有 compose 内容** |
+| `environmentVariables[]` | `{variable, price}` —— **`price` 就是 value**（UGOS 字段名拼写错误） |
+| `portMapping[]` | `{nasPort, containerPort, portType}` |
+| `volumes[]` | `{nasDirectory, containerDirectory, containerPermission}`（可能为 `null`） |
+| `networkMode` / `subnetSettings[]` / `nasIPs` | 网络 |
+| `cpuLimit` / `memLimit` / `noRestrictions` / `privilegedMode` | 资源与权限 |
+| `containerRunCommand` | 运行命令（本机多为 `null`） |
+
+`ShowContainerDetailListV2` 的 `volumes` / `portMapping` 与上面同构，但 `nasPort` / `containerPort` 是**字符串**。
 
 ### 文件管理
 
@@ -213,6 +299,12 @@ GET https://<ip>:9443<entry>/js/*.js     → 正则提取 "v\d+/模块/动作"
 ```
 
 本机已装应用（节选）：Docker、文件管理、存储管理、任务管理器、控制面板、日志中心、快照、下载中心、迅雷、同步与备份、影视中心、音乐、相册、在线文档、保险箱、文件版本管理、网盘工具、安全管家、应用中心、全局搜索、模型管理，以及 Docker 衍生应用 Lucky / 青龙 / qBittorrent / AI Plugins / 节点小宝。**未安装 KVM 虚拟机应用**。
+
+各应用 `entry` 对照（`GET v1/desktop/module/list` 的 `entry` 字段，实测）：`/docker`、`/filemgr`、`/storagemgr`、
+`/taskmgr`、`/ctlmgr`、`/logmgr`、**`/snapshot`（快照）**、`/version`（文件版本管理）、`/syncbackup`、`/appmgr`。
+
+> 注意：**存储管理 `/storagemgr` 的 bundle 里没有任何快照接口**（19 个懒加载分块全量搜索 `snapshot` 只命中
+> `snapshot_size` 这类空间占用字段）。快照功能在独立的 `/snapshot` 应用里，接口前缀是 `v1/snapshot/*`。
 
 ---
 
@@ -243,6 +335,34 @@ GET https://<ip>:9443<entry>/js/*.js     → 正则提取 "v\d+/模块/动作"
     `ShowContainerDetailListV2`（`cpuUsage`/`memUsage`/`upstreamTraffic`/`downstreamTraffic`/`restarting`）
     或 `view/ObtainOverviewInfo`（只含运行中容器）。`memoryUsagePercentage` 字段名有误导，实际单位是**字节**。
 18. **写操作要 `X-CurPass-Token`**：值为 RSA 加密后的密码，缺失返回 `1101`。见 §6.1。
+19. **`9404` 是"模块内路由不存在"的兜底码**，不是只有"客户端版本不匹配"。
+    实测 `GET v1/storage/foo/bar`、`GET v1/storage/xxx` 与 `GET v1/storage/snapshot/list` 全部返回 `9404`，
+    而同一模块的 `v1/storage/volume/list` 正常 200。→ 用 9404 判断"接口存在但版本不对"会误判。
+    真正的"路径不存在"是 **HTTP 404 + 非 JSON 响应**。
+20. **镜像接口只吃 POST**：`GET v1/docker/image/ShowLocalImageV2` 返回 `9405`，
+    同一路径 POST 正常。判断接口是否存在时，必须 GET/POST 都试一次。
+21. **`ObtainAllImages` 不是本地镜像列表**，而是 Docker Hub **商店搜索**（本机 1165 条、带 logo/分类/架构）。
+    本地镜像要用 `ShowLocalImageV2`（本机 38 条）。这对命名有强烈误导性。
+22. **快照端点在独立应用 `/snapshot` 里**：存储管理 bundle 全量搜索无 `snapshot` 接口；
+    而 `/snapshot` 应用入口 JS 本身也搜不到，端点藏在它的 3 个懒加载分块
+    （`index-B1-*.js` 有 `folder/*`，`index-Bgl3*.js` 有 `data/*`）里。
+    最终靠"路由不存在=404 / 存在但参数错=9999"这一差异暴力枚举出
+    `v1/snapshot/snapshot`（POST 创建 / GET 列表）与 `v1/snapshot/snapshot/restore`（回滚）。
+23. **快照列表的分页参数名是 `page_number` / `page_size`**，不是 `limit` / `offset`、也不是 `page` / `size`。
+    传错时错误信息里出现的 "limit is 0" 会误导你以为要传 `limit`。
+24. **快照只支持 Btrfs**：ext4 卷上创建/回滚直接 `9999 ... is not btrfs filesystem`，列表 `32003 文件夹不存在`。
+    同一台机器上"接口通了"和"功能可用"是两件事。
+25. **删除类接口的幂等陷阱**：`DeleteImage`、`BatchDeleteImage`、`DELETE v1/snapshot/snapshot`
+    对**不存在**的目标都返回 `success/successful`。判断真伪只能"删完再列一次"。
+26. **`BatchDeleteImage` 的 `imageIds` 必须是对象数组**，元素形如
+    `{id,status,imageName,imageVersion}`；传 `["sha256:…"]` 会报
+    `json: cannot unmarshal string into Go struct field BatchDeleteImageRequest.imageIds`。
+27. **固件版本号有字符串和整数两套**：`firmware/status.current_version="1.19.1.0126"` 对
+    `firmware/version/is_new.current_version=119010126`。只有 `is_new.has_version` 能可靠判断"有更新"。
+28. **容器详情里的环境变量字段叫 `price`**（`{variable, price}`），不是 `value` ——
+    UGOS 前端把 `value` 拼错成了 `price`，实测确实如此。
+29. **`GetContainerById` 没有 compose 内容**。docker 应用 87 个端点里没有任何 compose/project/yaml 读取接口，
+    只有 `projectName` 字段。compose 文件以普通文件存在 NAS 磁盘上。
 
 ---
 

@@ -46,6 +46,15 @@ def _result(data: Any) -> list[dict]:
     return []
 
 
+def _pick(data: dict, keys: tuple[str, ...]):
+    """按候选键名取第一个非空值，用于字段名未确认的结构（如 UPS）。"""
+    for k in keys:
+        val = data.get(k)
+        if val is not None and val != "":
+            return val
+    return None
+
+
 # SMART 属性 ID → 归一化字段。ID 取自 ATA 规范，实测本机 WD40EFPX 全部命中。
 SMART_FIELDS = {
     1: "read_error_rate",
@@ -122,6 +131,11 @@ class NasService:
     def has_session(self) -> bool:
         return self._c.has_session
 
+    @property
+    def client(self) -> UgosClient:
+        """暴露底层客户端，供镜像/快照等跨域模块复用同一会话。"""
+        return self._c
+
     # ------------------------------------------------------------------ 系统
 
     async def system(self) -> dict:
@@ -181,6 +195,94 @@ class NasService:
             "ups": hw.get("ups"),
             "usb": hw.get("usb") or [],
             "gpu": hw.get("gpu"),
+        }
+
+    # ------------------------------------------------------------------ 固件 / UPS
+
+    async def firmware(self) -> dict:
+        """固件版本查询（只读）。
+
+        实测：`firmware/status` 的 `current_version` 是字符串（1.19.1.0126），
+        而 `firmware/version/is_new` 里同名字段是整数（119010126），不能混用。
+        本中间层**不提供升级动作**，升级不可逆且 App 端只做提醒。
+        """
+        return await self._cache.get_or_set("firmware", self._s.ttl_system, self._fetch_firmware)
+
+    async def _fetch_firmware(self) -> dict:
+        status = await self._c.get("v1/firmware/status") or {}
+        newest = await self._c.get("v1/firmware/version/is_new") or {}
+        remote = status.get("remote_base") or {}
+
+        # 版本号两种形态：status 里是 "1.20.0.0142"，is_new 里是 120000142
+        latest = remote.get("versionName") or ""
+        publish_num = newest.get("publish_version")
+        has_update = bool(newest.get("has_version"))
+        if not latest and publish_num:
+            latest = str(publish_num)
+
+        return {
+            "current_version": status.get("current_version") or "",
+            "latest_version": latest or None,
+            "has_update": has_update,
+            "beta": bool(remote.get("beta")),
+            "size_bytes": int(remote.get("size") or remote.get("byteSize") or 0),
+            "notes": remote.get("desc") or "",
+            "checking": bool(status.get("running")),
+            # 以下三个原始码含义未完全确认（本机 current_stat=2 / operate_type=5），原样透出
+            "state": status.get("current_stat"),
+            "operate_type": status.get("operate_type"),
+            "request_failed_reason": status.get("request_failed_reason"),
+            "last_check_at": status.get("prev_check_timestamp"),
+            "version_numbers": {
+                "current": newest.get("current_version"),
+                "publish": publish_num,
+            },
+            "upgrade_supported": False,
+            "note": "只读查询。固件升级不可逆，中间层不实现升级动作。",
+            "collected_at": int(time.time()),
+        }
+
+    async def ups(self) -> dict:
+        """UPS 状态。
+
+        `sysinfo/machine/common` 的 `hardware.ups` 在未接 UPS 时恒为 `null`，
+        已接时的字段名**本机无法验证**，因此按常见命名做多键兜底，
+        并把原始对象整包透出，客户端可自行回退。
+        """
+        system = await self.system()
+        raw = system.get("ups")
+        if not isinstance(raw, dict) or not raw:
+            return {
+                "supported": False,
+                "connected": False,
+                "verified": True,
+                "reason": "hardware.ups 为 null：未接入 UPS，或 UPS 未被 UGOS 识别",
+                "raw": raw,
+                "collected_at": int(time.time()),
+            }
+
+        return {
+            "supported": True,
+            "connected": True,
+            "verified": False,
+            "model": _pick(raw, ("model", "name", "product", "vendor", "manufacturer")),
+            "status": _pick(raw, ("status", "state", "connect_status", "link_status")),
+            "battery_percent": _pick(
+                raw, ("battery_charge", "charge", "battery_percent", "capacity",
+                      "battery_level", "percent", "battery")
+            ),
+            "runtime_seconds": _pick(
+                raw, ("runtime", "battery_runtime", "remain_time", "left_time",
+                      "run_time", "remaining_time")
+            ),
+            "on_battery": _pick(
+                raw, ("on_battery", "onbattery", "battery_power", "using_battery",
+                      "is_battery", "power_supply_fail", "ac_lost")
+            ),
+            "events": _pick(raw, ("events", "event_list", "switch_events", "last_event")),
+            "raw": raw,
+            "note": "字段名未经真机验证（本机 hardware.ups 为 null），normalized 值仅供参考",
+            "collected_at": int(time.time()),
         }
 
     # ------------------------------------------------------------------ 实时
@@ -522,6 +624,87 @@ class NasService:
             "lines": keep,
         }
 
+    async def container_detail(self, container_id: str) -> dict:
+        """容器详情：环境变量、端口映射、卷、网络、资源限制。
+
+        实测契约（`GET v1/docker/container/GetContainerById`）：
+        - 环境变量数组的字段名是 `variable` + **`price`**（UGOS 把 value 拼错成 price）
+        - 端口映射 `portMapping[{nasPort, containerPort, portType}]`
+        - **没有 compose 内容**：docker 应用 87 个端点里没有任何 compose/project/yaml 读取接口，
+          compose 文件只存在 NAS 磁盘上（`/volume1/@appstore/...`），需走文件管理接口才能读到
+        """
+        if not container_id or len(container_id) < 8:
+            raise ValueError("containerId 非法")
+        raw = await self._c.get(
+            "v1/docker/container/GetContainerById", {"containerId": container_id}
+        ) or {}
+
+        env = []
+        for e in raw.get("environmentVariables") or []:
+            if not isinstance(e, dict):
+                continue
+            env.append(
+                {
+                    "key": e.get("variable") or e.get("name"),
+                    "value": e.get("price") if "price" in e else e.get("value"),
+                }
+            )
+
+        ports = [
+            {
+                "nas_port": p.get("nasPort"),
+                "container_port": p.get("containerPort"),
+                "protocol": p.get("portType"),
+            }
+            for p in (raw.get("portMapping") or [])
+            if isinstance(p, dict)
+        ]
+
+        volumes = [
+            {
+                "nas_path": v.get("nasDirectory"),
+                "container_path": v.get("containerDirectory"),
+                "mode": v.get("containerPermission"),
+            }
+            for v in (raw.get("volumes") or [])
+            if isinstance(v, dict)
+        ]
+
+        return {
+            "id": container_id,
+            "id_short": container_id[:12],
+            "name": raw.get("containerName"),
+            "image": raw.get("imageName"),
+            "tag": raw.get("tag") or raw.get("imageVersion"),
+            "image_id": raw.get("imageId"),
+            "project": raw.get("projectName") or "",
+            "running": bool(raw.get("runContainer")),
+            "network": {
+                "mode": raw.get("networkMode"),
+                "subnets": raw.get("subnetSettings") or [],
+                "nas_ips": raw.get("nasIPs") or [],
+            },
+            "limits": {
+                "no_restrictions": bool(raw.get("noRestrictions")),
+                "cpu_limit": raw.get("cpuLimit"),
+                "mem_limit": raw.get("memLimit"),
+            },
+            "privileged": bool(raw.get("privilegedMode")),
+            "hardware_acceleration": bool(raw.get("hardwareAcceleration")),
+            "environment": env,
+            "ports": ports,
+            "volumes": volumes,
+            "run_command": raw.get("containerRunCommand"),
+            # compose 内容拿不到，明确告知客户端不要期待这个字段
+            "compose": {
+                "available": False,
+                "supported": False,
+                "reason": "UGOS Docker 应用未暴露 compose 读取端点；"
+                          "compose 文件仅存于 NAS 磁盘，需用文件管理接口读取",
+            },
+            "collected_at": int(time.time()),
+        }
+
     async def docker_usage(self) -> dict:
         """Docker 资源占用。
 
@@ -687,6 +870,22 @@ class NasService:
             caps["docker_usage"] = True
         except Exception:  # noqa: BLE001
             caps["docker_usage"] = False
+        # 镜像接口只吃 POST，用 GET 探测会得到 9405
+        try:
+            await self._c.post(
+                "v1/docker/image/ShowLocalImageV2", {"PageNum": 1, "PageSize": 1}
+            )
+            caps["images"] = True
+        except Exception:  # noqa: BLE001
+            caps["images"] = False
+        # 快照需要 page_number/page_size，缺了会 9999
+        try:
+            await self._c.get(
+                "v1/snapshot/folder/share", {"page_number": 1, "page_size": 1}
+            )
+            caps["snapshots"] = True
+        except Exception:  # noqa: BLE001
+            caps["snapshots"] = False
         # SMART 需要一块真实磁盘做探测
         caps["smart"] = False
         caps["benchmark"] = False
@@ -702,4 +901,8 @@ class NasService:
                 caps["benchmark"] = True
         except Exception as exc:  # noqa: BLE001
             log.warning("SMART/测速探测失败：%s", exc)
+        try:
+            caps["ups_connected"] = bool((await self.system()).get("ups"))
+        except Exception:  # noqa: BLE001
+            caps["ups_connected"] = False
         return caps
