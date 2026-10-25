@@ -40,6 +40,8 @@ xcodegen --version
 echo "==> 生成工程"
 cd "$IOS_DIR"
 xcodegen generate
+# Info.plist 由 xcodegen 生成，必须确认落地，否则 xcodebuild 会以 INFOPLIST_FILE 找不到报错
+[ -f "$IOS_DIR/NasManager/Info.plist" ] || { echo "Info.plist 未生成，检查 project.yml 的 info.path" >&2; exit 1; }
 
 # 注意：变量必须用 ${} 包起来，否则紧跟的中文全角括号会被 bash 当作变量名的一部分
 echo "==> 构建（模式: ${MODE}）"
