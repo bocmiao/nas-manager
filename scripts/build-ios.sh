@@ -32,7 +32,7 @@ if ! command -v xcodegen >/dev/null; then
   command -v brew >/dev/null || { echo "缺少 homebrew，请先安装 xcodegen" >&2; exit 1; }
   brew install xcodegen
 fi
-xcodebuild -version | head -1
+xcodebuild -version | sed -n '1p'
 xcodegen --version
 
 [ "$CLEAN" = "1" ] && { echo "==> 清理"; rm -rf "$BUILD_DIR" "$IOS_DIR/$PROJECT"; }
