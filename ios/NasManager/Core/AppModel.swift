@@ -71,13 +71,15 @@ final class AppModel {
         publicHost = defaults.string(forKey: SettingsKeys.publicHost) ?? ""
         port = defaults.string(forKey: SettingsKeys.port) ?? "9443"
         username = defaults.string(forKey: SettingsKeys.username) ?? ""
-        rememberPassword = defaults.bool(forKey: SettingsKeys.rememberPassword)
+        // 注意：init 中必须先完成所有存储属性赋值，不能读 self 上的其他属性
+        let remember = defaults.bool(forKey: SettingsKeys.rememberPassword)
+        rememberPassword = remember
         if defaults.object(forKey: SettingsKeys.refreshInterval) == nil {
             refreshInterval = 30
         } else {
             refreshInterval = defaults.double(forKey: SettingsKeys.refreshInterval)
         }
-        password = rememberPassword
+        password = remember
             ? (KeychainStore.load(account: SettingsKeys.passwordAccount) ?? "")
             : ""
     }
