@@ -1,0 +1,14 @@
+# 统一换行，避免在 macOS / Linux 下因 CRLF 报错
+* text=auto eol=lf
+
+*.sh    text eol=lf
+*.yml   text eol=lf
+*.yaml  text eol=lf
+*.py    text eol=lf
+*.swift text eol=lf
+*.md    text eol=lf
+*.json  text eol=lf
+
+*.p12   binary
+*.png   binary
+*.ipa   binary

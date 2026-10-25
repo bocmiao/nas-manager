@@ -1,0 +1,24 @@
+services:
+  nasmanager:
+    build: .
+    image: nasmanager-middleware:0.1.0
+    container_name: nasmanager
+    restart: unless-stopped
+    ports:
+      - "8787:8787"
+    env_file:
+      - ../.env
+    environment:
+      TZ: Asia/Shanghai
+      LOG_LEVEL: INFO
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8787/health', timeout=4).status==200 else 1)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

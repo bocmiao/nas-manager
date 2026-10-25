@@ -1,0 +1,54 @@
+name: NasManager
+options:
+  bundleIdPrefix: dev.nasmanager
+  deploymentTarget:
+    iOS: "17.0"
+  createIntermediateGroups: true
+  generateEmptyDirectories: true
+
+settings:
+  base:
+    SWIFT_VERSION: "5.9"
+    MARKETING_VERSION: "0.1.0"
+    CURRENT_PROJECT_VERSION: "1"
+    ENABLE_USER_SCRIPT_SANDBOXING: "NO"
+
+targets:
+  NasManager:
+    type: application
+    platform: iOS
+    sources:
+      - path: NasManager
+    info:
+      path: NasManager/Info.plist
+      properties:
+        CFBundleDisplayName: NAS
+        CFBundleShortVersionString: $(MARKETING_VERSION)
+        CFBundleVersion: $(CURRENT_PROJECT_VERSION)
+        UILaunchScreen:
+          UIColorName: ""
+        UISupportedInterfaceOrientations:
+          - UIInterfaceOrientationPortrait
+        ITSAppUsesNonExemptEncryption: false
+        # 自签证书 + 局域网地址，自用不上架
+        NSAppTransportSecurity:
+          NSAllowsArbitraryLoads: true
+          NSAllowsLocalNetworking: true
+        NSLocalNetworkUsageDescription: 需要访问局域网内的 NAS 设备
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: dev.nasmanager.app
+        TARGETED_DEVICE_FAMILY: "1"
+        CODE_SIGN_STYLE: Automatic
+        SUPPORTS_MACCATALYST: "NO"
+        SWIFT_STRICT_CONCURRENCY: minimal
+
+schemes:
+  NasManager:
+    build:
+      targets:
+        NasManager: all
+    run:
+      config: Debug
+    archive:
+      config: Release

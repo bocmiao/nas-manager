@@ -1,0 +1,223 @@
+import Foundation
+
+// MARK: - 系统信息 `v1/sysinfo/machine/common`
+
+struct MachineInfo: Decodable {
+    struct Common: Decodable {
+        let nasName: String?
+        let model: String?
+        let serial: String?
+        let systemVersion: String?
+        let runTime: Int?
+        let lastTurnOnTimestamp: Int?
+
+        enum CodingKeys: String, CodingKey {
+            case nasName = "nas_name"
+            case model
+            case serial
+            case systemVersion = "system_version"
+            case runTime = "run_time"
+            case lastTurnOnTimestamp = "last_turn_on_timestamp"
+        }
+    }
+
+    struct Hardware: Decodable {
+        struct CPU: Decodable {
+            let model: String?
+            let core: Int?
+            let thread: Int?
+            let ghz: Int?
+            let temperature: Int?
+        }
+
+        struct Memory: Decodable {
+            let manufacturer: String?
+            let size: UInt64?
+            let mhz: String?
+        }
+
+        struct Net: Decodable {
+            let model: String?
+            let ip: String?
+            let speed: Int?
+            let duplex: String?
+        }
+
+        let cpu: [CPU]?
+        let mem: [Memory]?
+        let net: [Net]?
+    }
+
+    let common: Common?
+    let hardware: Hardware?
+}
+
+// MARK: - 实时监控 `v1/taskmgr/stat/overview`
+
+struct LiveOverview: Decodable {
+    struct CPUSample: Decodable {
+        let usedPercent: Double?
+        let temp: Int?
+        enum CodingKeys: String, CodingKey {
+            case usedPercent = "used_percent"
+            case temp
+        }
+    }
+
+    struct MemSample: Decodable {
+        let usedPercent: Double?
+        enum CodingKeys: String, CodingKey {
+            case usedPercent = "used_percent"
+        }
+    }
+
+    struct NetSample: Decodable {
+        let sendRate: UInt64?
+        let recvRate: UInt64?
+        enum CodingKeys: String, CodingKey {
+            case sendRate = "send_rate"
+            case recvRate = "recv_rate"
+        }
+    }
+
+    struct FanSample: Decodable {
+        let speed: Int?
+        let status: Int?
+    }
+
+    let cpu: [CPUSample]?
+    let mem: [MemSample]?
+    let net: [NetSample]?
+    let cpuFan: [FanSample]?
+    let deviceFan: [FanSample]?
+
+    enum CodingKeys: String, CodingKey {
+        case cpu, mem, net
+        case cpuFan = "cpu_fan"
+        case deviceFan = "device_fan"
+    }
+
+    var cpuUsage: Double? { cpu?.first?.usedPercent }
+    var cpuTemp: Int? { cpu?.first?.temp }
+    var memUsage: Double? { mem?.first?.usedPercent }
+    var sendRate: UInt64? { net?.first?.sendRate }
+    var recvRate: UInt64? { net?.first?.recvRate }
+    var cpuFanSpeed: Int? { cpuFan?.first?.speed }
+    var deviceFanSpeed: Int? { deviceFan?.first?.speed }
+}
+
+// MARK: - 磁盘 `v2/storage/disk/list`
+
+struct DiskList: Decodable {
+    let result: [Disk]?
+}
+
+struct Disk: Decodable, Identifiable {
+    let model: String?
+    let label: String?
+    let name: String?
+    let brand: String?
+    let size: UInt64?
+    let temperature: Int?
+    let powerOnHours: Int?
+    let status: Int?
+    let usedFor: String?
+
+    var id: String { name ?? label ?? UUID().uuidString }
+
+    /// 实测 status 0 / 1 均为正常（1 = 已激活在用）
+    var isHealthy: Bool { status == 0 || status == 1 }
+
+    enum CodingKeys: String, CodingKey {
+        case model, label, name, brand, size, temperature, status
+        case powerOnHours = "power_on_hours"
+        case usedFor = "used_for"
+    }
+}
+
+// MARK: - 存储池 `v1/storage/pool/list`
+
+struct PoolList: Decodable {
+    let result: [Pool]?
+}
+
+struct Pool: Decodable, Identifiable {
+    let name: String?
+    let label: String?
+    let level: String?
+    let status: Int?
+    let total: UInt64?
+    let used: UInt64?
+    let totalDiskNum: Int?
+
+    var id: String { name ?? label ?? UUID().uuidString }
+    var isHealthy: Bool { status == 0 }
+    var isRedundant: Bool {
+        ["raid1", "raid5", "raid6", "raid10", "raidz1", "raidz2"].contains((level ?? "").lowercased())
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case name, label, level, status, total, used
+        case totalDiskNum = "total_disk_num"
+    }
+}
+
+// MARK: - 存储卷 `v1/storage/volume/list`
+
+struct VolumeList: Decodable {
+    let result: [Volume]?
+}
+
+struct Volume: Decodable, Identifiable {
+    let name: String?
+    let label: String?
+    let filesystem: String?
+    let total: UInt64?
+    let used: UInt64?
+    let available: UInt64?
+    let mntpath: String?
+    let health: Int?
+
+    var id: String { name ?? label ?? UUID().uuidString }
+
+    var usedPercent: Double {
+        guard let total, total > 0, let used else { return 0 }
+        return Double(used) / Double(total) * 100
+    }
+}
+
+// MARK: - 容器 `v1/docker/container/ContainerListV2`
+
+struct ContainerList: Decodable {
+    let total: Int?
+    let result: [Container]?
+}
+
+struct Container: Decodable, Identifiable {
+    let name: String?
+    let containerId: String?
+    let imageName: String?
+    let status: String?
+    let projectName: String?
+
+    var id: String { containerId ?? name ?? UUID().uuidString }
+    var isRunning: Bool { (status ?? "") == "running" }
+
+    enum CodingKeys: String, CodingKey {
+        case name, status
+        case containerId, imageName, projectName
+    }
+}
+
+// MARK: - 聚合
+
+struct Dashboard {
+    var machine: MachineInfo?
+    var live: LiveOverview?
+    var disks: [Disk] = []
+    var pools: [Pool] = []
+    var volumes: [Volume] = []
+    var containers: [Container] = []
+
+    var runningContainers: Int { containers.filter(\.isRunning).count }
+}

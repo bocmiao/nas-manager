@@ -1,0 +1,46 @@
+# --- 凭据：绝不能入库 ---
+.env
+*.pem
+*.p12
+*.mobileprovision
+AuthKey_*.p8
+Secrets.xcconfig
+
+# --- 探测产物（含真实设备数据）---
+.probe/
+*.probe
+
+# --- 工作区私有记录（含开发者的环境细节，绝不能入库）---
+.workbuddy/
+workbuddy/
+
+# --- Python ---
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+.pytest_cache/
+
+# --- Xcode / Swift ---
+build/
+DerivedData/
+*.ipa
+*.dSYM
+*.dSYM.zip
+*.xcuserstate
+xcuserdata/
+*.xcodeproj/
+!ios/*.xcodeproj/project.pbxproj
+*.xcworkspace/xcuserdata/
+
+# --- 系统 / 编辑器 ---
+.DS_Store
+Thumbs.db
+node_modules/
+*.log
+.idea/
+.vscode/
+
+# 交接备忘，不入库
+overview.md
