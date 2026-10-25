@@ -42,28 +42,6 @@ struct UgosEndpoint: Hashable, Codable {
     var displayName: String { "\(host):\(port)" }
 }
 
-// MARK: - 自签证书处理
-
-/// UGOS 使用自签 X.509 v1 证书，系统校验必然失败。
-///
-/// 目前策略：信任该连接。
-/// 后续应改为 TOFU —— 首次记录证书指纹，之后比对，指纹变化时拒绝并提示用户。
-/// 指纹能力已在 `UgosCrypto.fingerprint(of:)` 里准备好。
-final class SelfSignedTrustDelegate: NSObject, URLSessionDelegate {
-    func urlSession(
-        _ session: URLSession,
-        didReceive challenge: URLAuthenticationChallenge,
-        completionHandler: @escaping (URLSession.AuthChallengeDisposition, URLCredential?) -> Void
-    ) {
-        guard challenge.protectionSpace.authenticationMethod == NSURLAuthenticationMethodServerTrust,
-              let trust = challenge.protectionSpace.serverTrust else {
-            completionHandler(.performDefaultHandling, nil)
-            return
-        }
-        completionHandler(.useCredential, URLCredential(trust: trust))
-    }
-}
-
 // MARK: - 客户端
 
 /// 直连 UGOS Pro 的客户端。
@@ -73,10 +51,11 @@ final class SelfSignedTrustDelegate: NSObject, URLSessionDelegate {
 /// - 读操作主通道是 `GET` + `?token=<明文>`
 /// - POST 的 token 同样走 query
 /// - 会话过期返回 1024 / 1010，需静默重登
+/// - 自签证书走 TOFU（`TOFUTrustDelegate`），不再无条件信任
 actor UgosClient {
     private let endpoint: UgosEndpoint
     private let session: URLSession
-    private let trustDelegate: SelfSignedTrustDelegate
+    private let trustDelegate: TOFUTrustDelegate
 
     private var token: String = ""
     private var credentials: (username: String, password: String)?
@@ -93,7 +72,7 @@ actor UgosClient {
 
     init(endpoint: UgosEndpoint) {
         self.endpoint = endpoint
-        let delegate = SelfSignedTrustDelegate()
+        let delegate = TOFUTrustDelegate()
         self.trustDelegate = delegate
         let config = URLSessionConfiguration.ephemeral
         config.timeoutIntervalForRequest = 20
@@ -257,9 +236,14 @@ actor UgosClient {
     }
 
     /// POST，token 同样走 query（实测 header 方式多返回 9404）。
-    func post(_ path: String, json: [String: Any] = [:]) async throws -> Any {
+    /// params 用于少数既需要 body 又需要 query 的接口，默认空。
+    func post(
+        _ path: String,
+        json: [String: Any] = [:],
+        params: [String: String] = [:]
+    ) async throws -> Any {
         let body = try JSONSerialization.data(withJSONObject: json)
-        return try await perform(path: path, method: "POST", params: [:], body: body)
+        return try await perform(path: path, method: "POST", params: params, body: body)
     }
 
     /// 泛型便捷方法：把接口返回的 data 直接解码成模型。

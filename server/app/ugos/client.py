@@ -6,6 +6,7 @@
 - 读操作主通道：GET + ?token=<明文 token>
 - POST 带 token 多数接口返回 9404，因此 token 一律走 query
 - 会话过期返回 1024 / 1010，需静默重登
+- 写操作（磁盘测速等）需额外请求头 `X-CurPass-Token`，值为 RSA 加密后的密码
 """
 from __future__ import annotations
 
@@ -33,12 +34,17 @@ DEFAULT_HEADERS = {
 
 
 class UgosError(Exception):
-    """UGOS 业务错误。code 为接口返回码，非 HTTP 状态码。"""
+    """UGOS 业务错误。code 为接口返回码，非 HTTP 状态码。
 
-    def __init__(self, code: int, msg: str = "", path: str = "") -> None:
+    `debug` 是接口附带的细节（例如 9999 时的 `disk is busy: 1`），
+    比笼统的 `msg` 有用得多，单独保留。
+    """
+
+    def __init__(self, code: int, msg: str = "", path: str = "", debug: str = "") -> None:
         self.code = code
         self.msg = msg or f"UGOS error {code}"
         self.path = path
+        self.debug = debug
         super().__init__(f"[{code}] {self.msg}" + (f" ({path})" if path else ""))
 
 
@@ -52,6 +58,7 @@ class UgosClient:
         self._username = username
         self._password = password
         self._token = ""
+        self._pass_token = ""
         self._lock = asyncio.Lock()
         self._http = httpx.AsyncClient(
             base_url=self._base,
@@ -144,6 +151,21 @@ class UgosClient:
             self._token = ""
             await self.login()
 
+    async def password_token(self, *, refresh: bool = False) -> str:
+        """取「本次操作密码令牌」。
+
+        实测：磁盘测速、删池等写操作需要在请求头带 `X-CurPass-Token`，
+        值就是 RSA 加密后的账号密码，缺失时返回 code 1101「密码验证失败」。
+        """
+        if self._pass_token and not refresh:
+            return self._pass_token
+        r = await self._http.post("/ugreen/v1/verify/check", json={"username": self._username})
+        pub = r.headers.get("x-rsa-token")
+        if not pub:
+            raise UgosAuthRequired(-1, "verify/check 未返回 X-Rsa-Token，无法生成密码令牌")
+        self._pass_token = self._encrypt_password(base64.b64decode(pub), self._password)
+        return self._pass_token
+
     # ---------- 请求 ----------
 
     def _url(self, path: str) -> str:
@@ -152,11 +174,12 @@ class UgosClient:
             p = "ugreen/" + p
         return "/" + p
 
-    async def get(self, path: str, params: dict | None = None, *, retry: bool = True):
+    async def get(self, path: str, params: dict | None = None, *, retry: bool = True,
+                  headers: dict | None = None):
         token = await self._ensure_token()
         q = dict(params or {})
         q["token"] = token
-        r = await self._http.get(self._url(path), params=q)
+        r = await self._http.get(self._url(path), params=q, headers=headers)
         data = self._parse(r, path)
 
         code = data.get("code")
@@ -165,16 +188,16 @@ class UgosClient:
         if code in AUTH_FAIL_CODES and retry:
             log.warning("会话失效 code=%s，重新登录后重试 %s", code, path)
             await self._relogin()
-            return await self.get(path, params, retry=False)
-        raise UgosError(code, data.get("msg") or data.get("debug") or "", path)
+            return await self.get(path, params, retry=False, headers=headers)
+        raise UgosError(code, data.get("msg") or "", path, data.get("debug") or "")
 
     async def post(self, path: str, body: dict | None = None, params: dict | None = None,
-                   *, retry: bool = True):
+                   *, retry: bool = True, headers: dict | None = None):
         """POST 的 token 同样走 query（实测 header 方式多返回 9404）。"""
         token = await self._ensure_token()
         q = dict(params or {})
         q["token"] = token
-        r = await self._http.post(self._url(path), json=body or {}, params=q)
+        r = await self._http.post(self._url(path), json=body or {}, params=q, headers=headers)
         data = self._parse(r, path)
 
         code = data.get("code")
@@ -183,8 +206,20 @@ class UgosClient:
         if code in AUTH_FAIL_CODES and retry:
             log.warning("会话失效 code=%s，重新登录后重试 %s", code, path)
             await self._relogin()
-            return await self.post(path, body, params, retry=False)
-        raise UgosError(code, data.get("msg") or data.get("debug") or "", path)
+            return await self.post(path, body, params, retry=False, headers=headers)
+        raise UgosError(code, data.get("msg") or "", path, data.get("debug") or "")
+
+    async def post_privileged(self, path: str, body: dict | None = None):
+        """需要二级密码确认的写操作：自动附带 X-CurPass-Token。"""
+        tok = await self.password_token()
+        try:
+            return await self.post(path, body, headers={"X-CurPass-Token": tok})
+        except UgosError as exc:
+            # 令牌过期则刷新后重试一次
+            if exc.code == 1101:
+                tok = await self.password_token(refresh=True)
+                return await self.post(path, body, headers={"X-CurPass-Token": tok})
+            raise
 
     @staticmethod
     def _parse(r: httpx.Response, path: str) -> dict:

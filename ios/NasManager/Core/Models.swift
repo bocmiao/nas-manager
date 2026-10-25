@@ -123,7 +123,7 @@ struct Disk: Decodable, Identifiable {
     let status: Int?
     let usedFor: String?
 
-    var id: String { name ?? label ?? UUID().uuidString }
+    var id: String { name ?? label ?? "-" }
 
     /// 实测 status 0 / 1 均为正常（1 = 已激活在用）
     var isHealthy: Bool { status == 0 || status == 1 }
@@ -150,7 +150,7 @@ struct Pool: Decodable, Identifiable {
     let used: UInt64?
     let totalDiskNum: Int?
 
-    var id: String { name ?? label ?? UUID().uuidString }
+    var id: String { name ?? label ?? "-" }
     var isHealthy: Bool { status == 0 }
     var isRedundant: Bool {
         ["raid1", "raid5", "raid6", "raid10", "raidz1", "raidz2"].contains((level ?? "").lowercased())
@@ -178,7 +178,7 @@ struct Volume: Decodable, Identifiable {
     let mntpath: String?
     let health: Int?
 
-    var id: String { name ?? label ?? UUID().uuidString }
+    var id: String { name ?? label ?? "-" }
 
     var usedPercent: Double {
         guard let total, total > 0, let used else { return 0 }
@@ -199,13 +199,43 @@ struct Container: Decodable, Identifiable {
     let imageName: String?
     let status: String?
     let projectName: String?
+    /// 列表接口部分固件会带资源占用；字段类型不稳定，用宽松解析，取不到就显示 “-”
+    let cpuPercent: Double?
+    let memPercent: Double?
 
-    var id: String { containerId ?? name ?? UUID().uuidString }
-    var isRunning: Bool { (status ?? "") == "running" }
+    var id: String { containerId ?? name ?? "-" }
+    var isRunning: Bool { (status ?? "").lowercased() == "running" }
 
     enum CodingKeys: String, CodingKey {
         case name, status
         case containerId, imageName, projectName
+        case cpuPercent = "cpu_percent"
+        case memPercent = "mem_percent"
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        name = try container.decodeIfPresent(String.self, forKey: .name)
+        containerId = try container.decodeIfPresent(String.self, forKey: .containerId)
+        imageName = try container.decodeIfPresent(String.self, forKey: .imageName)
+        status = try container.decodeIfPresent(String.self, forKey: .status)
+        projectName = try container.decodeIfPresent(String.self, forKey: .projectName)
+        cpuPercent = Container.flexibleDouble(container, key: .cpuPercent)
+        memPercent = Container.flexibleDouble(container, key: .memPercent)
+    }
+
+    /// 数字可能是 3 / 3.2 / "3.2"，三种都要能吃下
+    private static func flexibleDouble(
+        _ container: KeyedDecodingContainer<CodingKeys>,
+        key: CodingKeys
+    ) -> Double? {
+        if let value = try? container.decodeIfPresent(Double.self, forKey: key) {
+            return value
+        }
+        if let text = try? container.decodeIfPresent(String.self, forKey: key) {
+            return Double(text)
+        }
+        return nil
     }
 }
 

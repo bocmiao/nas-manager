@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from typing import Any
 
 from ..cache import TTLCache
@@ -43,6 +44,72 @@ def _result(data: Any) -> list[dict]:
     if isinstance(data, list):
         return [x for x in data if isinstance(x, dict)]
     return []
+
+
+# SMART 属性 ID → 归一化字段。ID 取自 ATA 规范，实测本机 WD40EFPX 全部命中。
+SMART_FIELDS = {
+    1: "read_error_rate",
+    5: "reallocated_sectors",
+    7: "seek_error_rate",
+    9: "power_on_hours",
+    10: "spin_retry_count",
+    12: "power_cycle_count",
+    187: "reported_uncorrectable",
+    194: "temperature",
+    196: "reallocated_event_count",
+    197: "pending_sectors",
+    198: "offline_uncorrectable",
+    199: "udma_crc_errors",
+}
+
+# 累计计数类属性：只有 raw > 0 才代表真有坏块/错误
+SMART_COUNTER_FIELDS = (
+    "reallocated_sectors",
+    "pending_sectors",
+    "offline_uncorrectable",
+    "reported_uncorrectable",
+    "reallocated_event_count",
+    "udma_crc_errors",
+)
+
+
+def demux_docker_log(raw: str) -> str:
+    """解 Docker 多路复用日志流。
+
+    每帧结构：1 字节流类型 + 3 字节保留 + 4 字节大端「字节长度」+ 载荷。
+    注意长度按 UTF-8 字节计，而响应体已被服务端解码成 str，
+    因此要按字符累加其 UTF-8 字节数来对齐，不能直接用字符下标。
+    解析失败时原样返回，避免把日志变成空串。
+    """
+    out: list[str] = []
+    i, n = 0, len(raw)
+    while i + 8 <= n:
+        head = raw[i : i + 8]
+        try:
+            length = int.from_bytes(head[4:8].encode("latin-1"), "big")
+        except UnicodeEncodeError:
+            return raw
+        if length <= 0 or length > n * 4:
+            return raw
+        j, consumed = i + 8, 0
+        while j < n and consumed < length:
+            consumed += len(raw[j].encode("utf-8"))
+            j += 1
+        if consumed != length:
+            return raw
+        out.append(raw[i + 8 : j])
+        i = j
+    if not out:
+        return raw
+    return "".join(out)
+
+
+def _smart_overall(attrs: list[dict]) -> str:
+    """属性 status：实测 1 = 正常。其余一律视为异常，原始码保留给上层判断。"""
+    bad = [a for a in attrs if a.get("status") not in (1, None)]
+    if not bad:
+        return "ok"
+    return "warning" if len(bad) < 3 else "failed"
 
 
 class NasService:
@@ -239,6 +306,125 @@ class NasService:
 
         return {"disks": disk_out, "pools": pool_out, "volumes": vol_out}
 
+    # ------------------------------------------------------------------ SMART
+
+    async def resolve_disk(self, ref: str) -> dict:
+        """把 sda / /dev/sda / 硬盘1 统一解析成磁盘条目。
+
+        SMART 与测速接口的 `disk` 参数实测必须传 dev_name（形如 /dev/sda），
+        传裸盘名 sda 会返回 code 5001「硬盘不存在」。
+        """
+        key = (ref or "").strip().lower()
+        if not key:
+            raise ValueError("磁盘标识不能为空")
+        disks = (await self.storage()).get("disks") or []
+        for d in disks:
+            dev = f"/dev/{d.get('name')}".lower()
+            names = {
+                str(d.get("name") or "").lower(),
+                dev,
+                str(d.get("label") or "").lower(),
+                str(d.get("serial") or "").lower(),
+            }
+            if key in names:
+                return d
+        raise ValueError(f"未找到磁盘：{ref}")
+
+    async def disk_smart(self, ref: str) -> dict:
+        disk = await self.resolve_disk(ref)
+        dev = f"/dev/{disk.get('name')}"
+
+        async def _fetch() -> dict:
+            if not disk.get("support_smart"):
+                return {"supported": False, "reason": "该磁盘不支持 SMART", "disk": disk}
+            raw = await self._c.get("v1/storage/disk/smart/info", {"disk": dev}) or {}
+            report = [a for a in (raw.get("report") or []) if isinstance(a, dict)]
+
+            attrs = [
+                {
+                    "id": a.get("id"),
+                    "name": a.get("name"),
+                    "label": a.get("label"),
+                    "value": a.get("value"),
+                    "worst": a.get("worst"),
+                    "threshold": a.get("thresh"),
+                    "raw": a.get("raw"),
+                    "raw_string": a.get("raw_string"),
+                    "status": a.get("status"),
+                }
+                for a in report
+            ]
+            # 关键项：按 ATA 属性 ID 取 raw 值
+            key_items: dict[str, Any] = {}
+            for a in report:
+                field = SMART_FIELDS.get(a.get("id"))
+                if field:
+                    key_items[field] = a.get("raw")
+
+            overall = _smart_overall(attrs)
+            last = raw.get("last") or {}
+            return {
+                "supported": True,
+                "disk": {
+                    "name": disk.get("name"),
+                    "dev": dev,
+                    "label": disk.get("label"),
+                    "model": disk.get("model"),
+                    "serial": disk.get("serial"),
+                    "slot": disk.get("slot"),
+                    "size": disk.get("size"),
+                },
+                "health": overall,
+                "key_items": key_items,
+                "counters": {k: key_items.get(k) for k in SMART_COUNTER_FIELDS},
+                "self_test": {
+                    "running": bool(raw.get("is_testing")),
+                    "type": raw.get("running_smart_type"),
+                    "progress": raw.get("progress"),
+                    "remain_seconds": raw.get("remain_time"),
+                    "short_test_seconds": raw.get("short_test_cost"),
+                    "long_test_seconds": raw.get("long_test_cost"),
+                    "last_status": last.get("status"),
+                    "last_at": last.get("last_time"),
+                    "next_at": last.get("next_time"),
+                },
+                "attributes": attrs,
+                "collected_at": int(time.time()),
+            }
+
+        return await self._cache.get_or_set(f"smart:{dev}", self._s.ttl_smart, _fetch)
+
+    async def disk_state(self, ref: str) -> dict:
+        disk = await self.resolve_disk(ref)
+        raw = await self._c.get(
+            "v1/storage/disk/runningState", {"disk": f"/dev/{disk.get('name')}"}
+        ) or {}
+        return {
+            "disk": disk.get("name"),
+            "status": raw.get("status"),
+            "temperature": raw.get("temperature"),
+            "power_start_at": raw.get("power_start_time"),
+            "reconnect_count": raw.get("reconnect_count"),
+            "rescan_count": raw.get("rescan_count"),
+            "reallocated_sector_count": raw.get("reallocated_sector_count"),
+            "spin_retry_count": raw.get("spin_retry_count"),
+            "nvme_percentage_used": raw.get("nvme_percentage_used"),
+            "badblocks_by_month": raw.get("key_datas") or [],
+        }
+
+    async def all_smart(self) -> list[dict]:
+        """巡检用：批量取所有支持 SMART 的磁盘，单盘失败不影响其它。"""
+        disks = (await self.storage()).get("disks") or []
+        out: list[dict] = []
+        for d in disks:
+            if not d.get("support_smart"):
+                continue
+            try:
+                out.append(await self.disk_smart(d.get("name") or ""))
+            except Exception as exc:  # noqa: BLE001 - 单盘失败降级
+                log.warning("读取 %s SMART 失败：%s", d.get("name"), exc)
+        return out
+
     # ------------------------------------------------------------------ 容器
 
     async def containers(self) -> list[dict]:
@@ -250,20 +436,44 @@ class NasService:
         raw = await self._c.post(
             "v1/docker/container/ContainerListV2", {"PageNum": 1, "PageSize": 500}
         ) or {}
-        return [
-            {
-                "name": c.get("name"),
-                "id": c.get("containerId"),
-                "image": c.get("imageName"),
-                "version": c.get("version"),
-                "project": c.get("projectName") or "",
-                "status": c.get("status") or "unknown",
-                "running": (c.get("status") or "") == "running",
-                "created_at": c.get("createAt"),
-                "application": c.get("application") or "",
-            }
-            for c in _result(raw)
-        ]
+        # 明细接口提供 restarting / cpuUsage / memUsage / 流量，按 id 合并
+        detail: dict[str, dict] = {}
+        try:
+            det = await self._c.post(
+                "v1/docker/container/ShowContainerDetailListV2", {"PageNum": 1, "PageSize": 500}
+            ) or {}
+            for d in det.get("result") or []:
+                if isinstance(d, dict) and d.get("containerId"):
+                    detail[d["containerId"]] = d
+        except Exception as exc:  # noqa: BLE001 - 明细不可用不影响列表
+            log.warning("容器明细获取失败：%s", exc)
+
+        out = []
+        for c in _result(raw):
+            cid = c.get("containerId") or ""
+            d = detail.get(cid) or {}
+            status = d.get("status") or c.get("status") or "unknown"
+            out.append(
+                {
+                    "name": c.get("name"),
+                    "id": cid,
+                    "id_short": cid[:12],
+                    "image": c.get("imageName"),
+                    "version": c.get("version"),
+                    "project": c.get("projectName") or "",
+                    "status": status,
+                    "running": status == "running",
+                    "restarting": bool(d.get("restarting")),
+                    "cpu_percent": d.get("cpuUsage"),
+                    "mem_bytes": d.get("memUsage"),
+                    "net_tx_bytes": d.get("upstreamTraffic"),
+                    "net_rx_bytes": d.get("downstreamTraffic"),
+                    "ports": d.get("portMapping") or [],
+                    "created_at": c.get("createAt"),
+                    "application": c.get("application") or "",
+                }
+            )
+        return out
 
     async def container_action(self, container_id: str, action: str) -> dict:
         endpoint = CONTAINER_ACTIONS.get(action)
@@ -277,15 +487,137 @@ class NasService:
         self._cache.invalidate("containers")
         return {"action": action, "container_id": container_id, "result": data}
 
-    async def container_logs(self, container_id: str, tail: int = 200) -> dict:
-        body = {"containerId": container_id, "ContainerId": container_id, "tail": tail, "Tail": tail}
-        data = await self._c.post("v1/docker/container/ShowContainerLogs", body)
-        return {"container_id": container_id, "data": data}
+    async def container_logs(self, container_id: str, tail: int = 200,
+                             keyword: str = "", stream: str = "") -> dict:
+        """容器日志。
+
+        实测：请求体只用 containerId / tail 两个字段即可（两者大小写都能过校验），
+        但服务端**忽略行数参数**、始终返回完整日志，因此 tail 在本地截断。
+        """
+        if not container_id or len(container_id) < 8:
+            raise ValueError("containerId 非法")
+        raw = await self._c.post(
+            "v1/docker/container/ShowContainerLogs",
+            {"containerId": container_id, "tail": tail},
+        ) or {}
+        body = raw.get("result") or {}
+        message = body.get("message") or ""
+        text = demux_docker_log(message)
+        lines = [ln for ln in text.splitlines() if ln.strip()]
+        if keyword:
+            kw = keyword.lower()
+            lines = [ln for ln in lines if kw in ln.lower()]
+        if stream in ("stdout", "stderr"):
+            # 解帧后已丢失流类型，这里只做兜底提示，不假装能区分
+            pass
+        truncated = len(lines) > tail
+        keep = lines[-tail:]
+        return {
+            "container_id": container_id,
+            "requested_tail": tail,
+            "total_lines": len(lines),
+            "returned_lines": len(keep),
+            "truncated": truncated,
+            "keyword": keyword or None,
+            "lines": keep,
+        }
 
     async def docker_usage(self) -> dict:
-        cpu = await self._c.get("v1/docker/container/ShowCpu")
-        mem = await self._c.get("v1/docker/container/ShowMemory")
-        return {"cpu": cpu, "memory": mem}
+        """Docker 资源占用。
+
+        `ShowCpu` / `ShowMemory` 实测是**宿主机级**（传 containerId 也不生效），
+        真正的按容器数据在 `docker/view/ObtainOverviewInfo` 的 overviewContainers。
+        """
+        raw = await self._c.get("v1/docker/view/ObtainOverviewInfo") or {}
+        items = []
+        for c in raw.get("overviewContainers") or []:
+            if not isinstance(c, dict):
+                continue
+            cid = c.get("containerId") or ""
+            items.append(
+                {
+                    "name": c.get("containerName"),
+                    "id": cid,
+                    "id_short": cid[:12],
+                    "cpu_percent": c.get("cpuUsagePercentage"),
+                    "mem_bytes": c.get("memoryUsagePercentage"),
+                    "mem_percent": (
+                        round(c.get("memoryUsagePercentage") / raw["totalMemory"] * 100, 2)
+                        if raw.get("totalMemory") and c.get("memoryUsagePercentage") is not None
+                        else None
+                    ),
+                    "net_tx_bytes": c.get("upstreamTraffic"),
+                    "net_rx_bytes": c.get("downstreamTraffic"),
+                }
+            )
+        items.sort(key=lambda x: (x.get("cpu_percent") or 0), reverse=True)
+        return {
+            "engine": {
+                "containers": raw.get("containerCount"),
+                "running": raw.get("runContainerCount"),
+                "images": raw.get("imageCount"),
+                "status": raw.get("status"),
+            },
+            "host": {
+                "cpu_percent": raw.get("cpuUsed"),
+                "mem_used": raw.get("memoryUsed"),
+                "mem_total": raw.get("totalMemory"),
+            },
+            "docker": {
+                "cpu_percent": raw.get("containerCpuUsed"),
+                "mem_used": raw.get("containerMemory"),
+                "mem_total": raw.get("containerTotalMemory"),
+            },
+            "containers": items,
+            "collected_at": int(time.time()),
+            "note": "mem_percent 为按容器内存 / 宿主机总内存折算；net_* 为累计字节数，非速率",
+        }
+
+    async def processes(self, limit: int = 50, sort: str = "cpu") -> dict:
+        raw = await self._c.get("v1/taskmgr/processes") or {}
+        items = [p for p in (raw.get("list") or []) if isinstance(p, dict)]
+        field = "mem_used" if sort == "mem" else "cpu_used_percent"
+        items.sort(key=lambda p: (p.get("consume") or {}).get(field) or 0, reverse=True)
+
+        def _norm(p: dict) -> dict:
+            c = p.get("consume") or {}
+            return {
+                "name": p.get("name"),
+                "pid": p.get("pid"),
+                "status": p.get("process_status"),
+                "status_text": p.get("status"),
+                "operable": bool(p.get("can_be_operated")),
+                "cpu_percent": c.get("cpu_used_percent"),
+                "mem_bytes": c.get("mem_used"),
+                "mem_percent": c.get("mem_used_percent"),
+            }
+
+        return {
+            "total": len(items),
+            "sort": sort,
+            "summary": raw.get("total_consume") or {},
+            "items": [_norm(p) for p in items[:limit]],
+        }
+
+    async def services(self) -> dict:
+        raw = await self._c.get("v1/taskmgr/services") or {}
+        items = [
+            {
+                "name": s.get("name"),
+                "id": s.get("id"),
+                "app_id": s.get("appid"),
+                "cpu_percent": (s.get("consume") or {}).get("cpu_used_percent"),
+                "mem_bytes": (s.get("consume") or {}).get("mem_used"),
+                "operable": bool(s.get("can_be_operated")),
+            }
+            for s in (raw.get("list") or [])
+            if isinstance(s, dict)
+        ]
+        return {
+            "total": len(items),
+            "summary": raw.get("total_consume") or {},
+            "items": items,
+        }
 
     # ------------------------------------------------------------------ 日志
 
@@ -332,6 +664,8 @@ class NasService:
             "logs": "v1/log/query",
             "firmware": "v1/firmware/status",
             "files": "v1/filemgr/getHomeFolderSet",
+            "processes": "v1/taskmgr/processes",
+            "services": "v1/taskmgr/services",
         }
         caps: dict[str, Any] = {}
         for name, path in probes.items():
@@ -348,4 +682,24 @@ class NasService:
             caps["docker"] = True
         except Exception:  # noqa: BLE001
             caps["docker"] = False
+        try:
+            await self._c.get("v1/docker/view/ObtainOverviewInfo")
+            caps["docker_usage"] = True
+        except Exception:  # noqa: BLE001
+            caps["docker_usage"] = False
+        # SMART 需要一块真实磁盘做探测
+        caps["smart"] = False
+        caps["benchmark"] = False
+        try:
+            disks = (await self.storage()).get("disks") or []
+            target = next((d for d in disks if d.get("support_smart")), None)
+            if target:
+                await self.disk_smart(target.get("name") or "")
+                caps["smart"] = True
+                await self._c.get(
+                    "v1/storage/disk/benchmark/info", {"disk": f"/dev/{target.get('name')}"}
+                )
+                caps["benchmark"] = True
+        except Exception as exc:  # noqa: BLE001
+            log.warning("SMART/测速探测失败：%s", exc)
         return caps

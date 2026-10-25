@@ -88,6 +88,20 @@ if (!isFormContentType && notInWhitelist && !baseUrl.startsWith("https")) {
 → **走 HTTPS 时请求体是明文**，只需处理 `X-Ugreen-Security-Key: md5(token)` 和可选的 `X-Ugreen-Token: RSA(token)`。
 响应若含 `encrypt_resp_body` 才需要 AES-128-GCM 解密。
 
+### 6.1 写操作的二次密码校验：`X-CurPass-Token`（实测）
+
+磁盘测速、删存储池、删卷、热备盘创建等**高危写操作**，除 `?token=` 外还需要：
+
+```
+X-CurPass-Token: <RSA 加密后的账号密码>
+```
+
+- 值与登录时的 `password` 字段算法完全相同：`verify/check` 取 `X-Rsa-Token` → RSA PKCS#1 v1.5 加密（超长分段、base64 拼接）
+- 缺失时返回 **`1101`「密码验证失败！」**
+- 令牌可复用，失效后重新生成即可
+- 来源：`me.post(url, body, {headers: {"X-CurPass-Token": password}})`，`password` 由前端的密码确认弹窗提供
+
+
 ### 7. 错误码
 
 | code | 含义 |
@@ -97,6 +111,8 @@ if (!isFormContentType && notInWhitelist && !baseUrl.startsWith("https")) {
 | 1005 | 参数错误 |
 | 1010 | Token 为空或格式非法 |
 | 1024 | 会话过期，需重登 |
+| 1101 | 写操作密码验证失败（缺/错 `X-CurPass-Token`） |
+| 5001 | 硬盘不存在（SMART/测速的 `disk` 参数值不对） |
 | 9404 | 客户端版本/通道不匹配（POST 带 token 时常出现） |
 | 9405 | 应用未安装或无权限 |
 | 9999 | 服务端操作失败（含参数校验，`debug` 字段有详情） |
@@ -128,8 +144,9 @@ if (!isFormContentType && notInWhitelist && !baseUrl.startsWith("https")) {
 | GET | `v1/taskmgr/stat/overview` | **一屏拿全**：`cpu{used_percent,temp}` `mem{used_percent}` `net{send_rate,recv_rate}` `disk{read_rate,write_rate}` `volume{read_rate,write_rate}` `gpu` **`cpu_fan{speed,status}` `device_fan{speed,status}`** |
 | GET | `v1/taskmgr/stat/get_all` | 上述全部 + 历史序列 + timestamp |
 | GET | `v1/taskmgr/stat/cpu` / `mem` / `disk` / `net` / `volume` / `gpu` | 单项，含 `series` 历史序列与 `max/avg` |
-| GET | `v1/taskmgr/processes` | 进程列表 |
-| GET | `v1/taskmgr/services` | 系统服务列表 |
+| GET | `v1/taskmgr/processes` | 进程列表：`total_consume` + `list[{name,pid,process_status,status,consume{cpu_used_percent,mem_used,...}}]`，无分页 |
+| GET | `v1/taskmgr/services` | 系统服务列表：`list[{name,id,appid,can_be_operated,consume{...}}]` |
+| POST | `v1/taskmgr/processes/{pid}/restart` / `v1/taskmgr/services/{id}/restart|stop` | 进程/服务操作（未验证，需密码校验） |
 | WSS | `v1/taskmgr/wss/subscribe` | 实时推送订阅（未验证，前端用它做秒级刷新） |
 
 ### 存储
@@ -140,9 +157,14 @@ if (!isFormContentType && notInWhitelist && !baseUrl.startsWith("https")) {
 | GET | `v1/storage/pool/list` | 存储池：RAID 级别、总容量、成员盘、卷列表 |
 | GET | `v1/storage/volume/list` | 卷：文件系统、总量/已用/可用、挂载点、健康状态、快照与压缩支持 |
 | GET | `v1/storage/overview` | 存储总览（当前仅返回弹窗提示状态） |
-| GET | `v1/storage/disk/smart/info` | SMART 明细（**需传盘参数，否则 code 9999**） |
-| GET | `v1/storage/disk/benchmark/start` / `stop` / `info` / `running` | **磁盘测速**（官方客户端未暴露） |
-| GET | `v1/storage/disk/ihm/info` / `start` | 硬盘健康分析（IHM） |
+| GET | `v1/storage/disk/smart/info?disk=/dev/sda` | SMART 明细，`disk` **必须传 dev_name**，返回 `report[]` 属性表 + `is_testing`/`progress`/`last` |
+| GET | `v1/storage/disk/runningState?disk=/dev/sda` | 盘运行状态：`reallocated_sector_count`/`reconnect_count`/按月 `badblocks` |
+| GET | `v1/storage/disk/attribute?disk=/dev/sda` | 盘身份信息：固件、转速、缓存、通电次数、标准协议 |
+| POST | `v1/storage/disk/benchmark/start` | 磁盘测速开始，body `{"disk":"/dev/sda"}`，**需 `X-CurPass-Token`** |
+| GET | `v1/storage/disk/benchmark/running?disk=/dev/sda` | 测速中返回 `{start_at, read_perf, write_perf}`，空闲返回 `null` |
+| GET | `v1/storage/disk/benchmark/info?disk=/dev/sda` | 测速档案 + 历史 `detection_list` |
+| POST | `v1/storage/disk/benchmark/stop` | 停止测速，body `{"disk":"/dev/sda"}` |
+| GET | `v1/storage/disk/ihm/info?disk=/dev/sda` | 硬盘健康分析（IHM），本机 `report_code=4`（未启用） |
 | GET | `v1/storage/disk/position` | 点亮盘位灯定位硬盘 |
 
 ### 日志
@@ -160,8 +182,12 @@ if (!isFormContentType && notInWhitelist && !baseUrl.startsWith("https")) {
 | GET | `v1/docker/container/StartContainer?containerId=<id>` | 启动 |
 | GET | `v1/docker/container/StopContainer?containerId=<id>` | 停止 |
 | POST | `v1/docker/container/BatchOperateContainer` | 批量操作 |
-| — | `v1/docker/container/ShowContainerLogs` | 容器日志 |
-| — | `v1/docker/container/ShowCpu` / `ShowMemory` | 容器资源占用 |
+| POST | `v1/docker/container/ShowContainerLogs` | 容器日志，body `{"containerId": "<id>", "tail": N}`，返回 `result.message` 为 Docker 多路复用流 |
+| POST | `v1/docker/container/ShowContainerDetailListV2` | **按容器的资源**：`cpuUsage` / `memUsage` / `upstreamTraffic` / `downstreamTraffic` / `restarting`，必传 `PageNum` |
+| GET | `v1/docker/view/ObtainOverviewInfo` | **Docker 总览**：引擎统计 + `overviewContainers[]`（仅运行中） |
+| GET | `v1/docker/view/GetEngineStatus` | `{"result": "online"}` |
+| GET | `v1/docker/container/GetContainerById?containerId=<id>` | 容器详情（环境变量、网络、端口、限制） |
+| GET | `v1/docker/container/ShowCpu` / `ShowMemory` | **宿主机级** CPU/内存，非容器级（传 containerId 无效） |
 | — | `v1/docker/container/AddTerminal` / `DelTerminal` | **容器内终端** |
 | — | `v1/docker/image/ObtainAllImages` / `ShowLocalImageV2` / `DeleteImage` / `DownloadImage` | 镜像管理 |
 | — | `v1/docker/view/GetEngineStatus` / `GetRegistryMirrors` / `SetRegistryMirrors` | Docker 引擎与镜像加速配置 |
@@ -204,8 +230,19 @@ GET https://<ip>:9443<entry>/js/*.js     → 正则提取 "v\d+/模块/动作"
 10. **`stat/overview` 的 `volume.read_rate` / `write_rate` 量级不稳定**：实测同一台机器先返回 `4.2e8`（≈402 MB/s），后又返回 `1.09e12`（≈1 TB/s）。怀疑是采样窗口内的累计字节数而非瞬时速率，需要对照前端图表逻辑才能定论。App 端不要直接当 B/s 渲染。
 11. **`POST` + `?token=` 是有效的**（`ContainerListV2` 验证通过），前提是 body 参数合法。之前把 POST 一律判为 9404 是错的——9404 只在缺参数或走 header 传 token 时出现。
 12. **容器操作是 GET**：`StartContainer` / `StopContainer` / `RestartContainer` 全部用 `GET ?containerId=<id>`，删除容器才是 POST `RemoveContainer`。
-13. **`ShowContainerLogs` 是 POST**，请求体字段名尚未完全确认，需同时兜底 `containerId` / `ContainerId` / `tail` / `Tail`。
-14. **`storage/disk/smart/info` 需要磁盘参数**，无参调用返回 `code 9999`（不是权限问题）。
+13. **`ShowContainerLogs` 是 POST**，请求体 `containerId` + `tail`（首字母大小写均可）。**服务端会忽略行数参数**，永远返回完整日志，`tail` 只能在客户端截断。返回的 `result.message` 是 Docker 多路复用流（8 字节帧头 = 1B 流类型 + 3B 保留 + 4B 大端长度），且**长度按 UTF-8 字节计而响应已是字符串**，解帧要按字符累加其 UTF-8 字节数对齐。
+14. **`storage/disk/smart/info` 的 `disk` 参数必须传 `dev_name`**（形如 `/dev/sda`，取自 `v2/storage/disk/list` 的 `dev_name` 字段）。
+    - 不传 → `9999`
+    - 传裸盘名 `sda` / 标签 `硬盘1` / 盘位 `ata1` / 序列号 → `5001 硬盘不存在`
+    - 这条同样适用于 `benchmark/*`、`runningState`、`attribute`、`ihm/info`
+15. **磁盘测速是「发起 + 轮询」两步**：`POST benchmark/start` 后由前端每 2 秒 `GET benchmark/running`，
+    返回 `null` 即表示结束，结果去 `benchmark/info` 的 `detection_list` 取（`read_perf.bw` / `write_perf.bw`，单位 MB/s）。
+16. **在用磁盘不能测速**：`benchmark/start` 对存储池内的盘返回 `9999` + `debug="disk is busy: 1"`。
+    这是业务规则，不是权限或参数问题，需要一块**未加入存储池**的盘才能跑通。
+17. **`ShowCpu` / `ShowMemory` 是宿主机级接口**，不是容器级。按容器的 CPU/内存/流量要用
+    `ShowContainerDetailListV2`（`cpuUsage`/`memUsage`/`upstreamTraffic`/`downstreamTraffic`/`restarting`）
+    或 `view/ObtainOverviewInfo`（只含运行中容器）。`memoryUsagePercentage` 字段名有误导，实际单位是**字节**。
+18. **写操作要 `X-CurPass-Token`**：值为 RSA 加密后的密码，缺失返回 `1101`。见 §6.1。
 
 ---
 
@@ -217,17 +254,17 @@ GET https://<ip>:9443<entry>/js/*.js     → 正则提取 "v\d+/模块/动作"
 |---|---|
 | 主机名 | DXP4800PLUS-XXXX |
 | 固件 | 1.19.1.0126 |
-| 已运行 | 38 天 |
-| CPU | Intel Pentium Gold 8505，5 核 6 线程 @4.4GHz，3.7%，41°C |
-| 内存 | Samsung 16GB DDR5-5600，占用 31.8% |
+| 已运行 | 数十天量级 |
+| CPU | Intel Pentium Gold 8505，5 核 6 线程 |
+| 内存 | 16GB DDR5-5600，占用约三分之一 |
 | 网口 | eth0 192.0.2.10，**协商 1000Mbps 全双工**（机型支持 2.5G） |
-| 风扇 | 机箱 544 RPM，CPU 风扇停转 |
-| 存储池 | pool1，**RAID0**，2 盘，7.2 TB |
-| 卷 | volume1，ext4，3.2 TB / 7.2 TB（45%），挂载 `/volume1`、`/home`、`/opt/<third-party-panel>/data` |
-| 磁盘 | 2 × WD40EFPX 4TB，36/37°C，通电 6367h，支持 SMART |
-| 容器 | 16 个，运行 9，非运行 7 |
+| 风扇 | 机箱数百 RPM，CPU 风扇停转 |
+| 存储池 | pool1，**RAID0**，2 盘，合计约 7.2 TB |
+| 卷 | volume1，ext4，已用约 45%，挂载 `/volume1`、`/home`、`/opt/<third-party-panel>/data` |
+| 磁盘 | 2 × 4TB 机械盘，三十余度，通电 6000+ 小时，支持 SMART |
+| 容器 | 十余个，多数运行中 |
 
 **风险提示**
 - **RAID0 + 2 盘 = 零冗余**，任一盘损坏全部数据丢失。
 - 网口只协商到 **1000Mbps**，机型是双 2.5GbE，怀疑上游是千兆交换机或网线为 Cat5e。
-- `/opt/<third-party-panel>/data` 显示已装第三方面板（秒面板），与 UGOS 自带 Docker 共用需注意目录冲突。
+- `/opt/<third-party-panel>/data` 显示已装第三方面板，与 UGOS 自带 Docker 共用需注意目录冲突。

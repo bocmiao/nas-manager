@@ -18,14 +18,16 @@ async def gather_snapshot(nas: NasService) -> dict:
         nas.live(),
         nas.storage(),
         nas.containers(),
+        nas.all_smart(),
         return_exceptions=True,
     )
-    names = ("system", "live", "storage", "containers")
+    names = ("system", "live", "storage", "containers", "smart")
+    empty = {"containers": [], "smart": []}
     snapshot: dict = {}
     for name, value in zip(names, results):
         if isinstance(value, BaseException):
             log.warning("数据源 %s 失败：%s", name, value)
-            snapshot[name] = [] if name == "containers" else {}
+            snapshot[name] = empty.get(name, {})
             snapshot.setdefault("degraded", []).append(name)
         else:
             snapshot[name] = value
@@ -74,6 +76,20 @@ async def build_overview(nas: NasService, engine: AlertEngine, snapshot: dict | 
             "volume": primary,
             "volume_count": len(volumes),
             "disk_count": len(storage.get("disks") or []),
+        },
+        "smart": {
+            "disks": [
+                {
+                    "name": (s.get("disk") or {}).get("name"),
+                    "label": (s.get("disk") or {}).get("label"),
+                    "health": s.get("health"),
+                    "temperature": (s.get("key_items") or {}).get("temperature"),
+                    "power_on_hours": (s.get("key_items") or {}).get("power_on_hours"),
+                    "reallocated_sectors": (s.get("counters") or {}).get("reallocated_sectors"),
+                }
+                for s in (snap.get("smart") or [])
+                if isinstance(s, dict)
+            ]
         },
         "containers": {
             "total": len(containers),

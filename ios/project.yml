@@ -8,7 +8,8 @@ options:
 
 settings:
   base:
-    SWIFT_VERSION: "5.9"
+    # SWIFT_VERSION 只接受语言模式（4.0 / 4.2 / 5.0 / 6.0），写 5.9 会被 xcodebuild 判为不支持
+    SWIFT_VERSION: "5.0"
     MARKETING_VERSION: "0.1.0"
     CURRENT_PROJECT_VERSION: "1"
     ENABLE_USER_SCRIPT_SANDBOXING: "NO"

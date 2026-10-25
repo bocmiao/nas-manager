@@ -19,7 +19,9 @@ from .cache import TTLCache
 from .config import get_settings
 from .security import RateLimiter
 from .services.alerts import AlertEngine
+from .services.benchmark import BenchmarkManager
 from .services.nas import NasService
+from .services.push import PushService
 from .services.snapshot import gather_snapshot
 from .ugos.client import UgosAuthRequired, UgosClient, UgosError
 
@@ -47,6 +49,8 @@ async def lifespan(app: FastAPI):
     )
     app.state.nas = NasService(app.state.client, app.state.cache, settings)
     app.state.alerts = AlertEngine(settings)
+    app.state.benchmark = BenchmarkManager(app.state.nas, settings)
+    app.state.push = PushService(settings)
     app.state.ugos_reachable = False
     app.state.last_poll_ok = False
     app.state.last_poll_at = 0
@@ -69,6 +73,11 @@ async def lifespan(app: FastAPI):
         log.warning("请写入 .env： API_TOKEN=%s", token)
         log.warning("=" * 60)
 
+    if settings.apns_configured:
+        log.info("APNs 推送已启用 topic=%s host=%s", settings.apns_topic, settings.apns_host)
+    else:
+        log.warning("未配置 APNs 凭据，告警只写日志不推送")
+
     async def poller() -> None:
         while True:
             try:
@@ -79,6 +88,8 @@ async def lifespan(app: FastAPI):
                 app.state.last_poll_at = int(time.time())
                 if events:
                     log.info("巡检状态变化 %d 条", len(events))
+                    for ev in events:
+                        await app.state.push.send_alert(ev)
             except asyncio.CancelledError:
                 raise
             except Exception:  # noqa: BLE001 - 巡检不能因单次失败退出
@@ -97,6 +108,8 @@ async def lifespan(app: FastAPI):
             await task
         except asyncio.CancelledError:
             pass
+        await app.state.benchmark.shutdown()
+        await app.state.push.close()
         await app.state.client.close()
         log.info("中间层已停止")
 

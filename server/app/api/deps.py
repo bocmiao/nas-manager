@@ -5,7 +5,9 @@ from fastapi import Request
 
 from ..security import verify_token
 from ..services.alerts import AlertEngine
+from ..services.benchmark import BenchmarkManager
 from ..services.nas import NasService
+from ..services.push import PushService
 
 
 def require_auth(request: Request) -> None:
@@ -18,3 +20,11 @@ def get_nas(request: Request) -> NasService:
 
 def get_alerts(request: Request) -> AlertEngine:
     return request.app.state.alerts
+
+
+def get_benchmark(request: Request) -> BenchmarkManager:
+    return request.app.state.benchmark
+
+
+def get_push(request: Request) -> PushService:
+    return request.app.state.push
