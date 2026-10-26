@@ -19,6 +19,7 @@ import time
 
 from ..cache import TTLCache
 from ..config import Settings
+from .logs import LogService
 from .nas import NasService
 
 log = logging.getLogger("users")
@@ -56,10 +57,12 @@ def _rows(data) -> list[dict]:
 
 
 class UserService:
-    def __init__(self, nas: NasService, cache: TTLCache, settings: Settings) -> None:
+    def __init__(self, nas: NasService, cache: TTLCache, settings: Settings,
+                 logs: LogService | None = None) -> None:
         self._nas = nas
         self._cache = cache
         self._s = settings
+        self._logs = logs
 
     @property
     def _c(self):
@@ -115,6 +118,18 @@ class UserService:
             "collected_at": int(time.time()),
         }
 
+    async def _log_rows(self, **filters) -> list[dict]:
+        """审计日志查询。
+
+        ⚠️ NAS 侧 `v1/log/query` 的 `page` **从 0 开始**：传 1 是第 21~40 条。
+        优先走 LogService（它做 0/1 基准换算），没有时也得显式传 0。
+        """
+        if self._logs is not None:
+            res = await self._logs.query(page=1, size=20, **filters)
+            return res.get("items") or []
+        params = {"page": 0, "size": 20, **filters}
+        return _rows(await self._c.get("v1/log/query", params))
+
     async def _last_login(self, username: str) -> tuple[int | None, str]:
         """反查审计日志里的最后登录时间。
 
@@ -124,8 +139,8 @@ class UserService:
         - `module=control_panel`、`operator=system`、`content="User <用户名> logged into the system via SSH."`
           （SSH 登录，用户名只出现在 content 里）
 
-        因此按用户名做一次 keyword 检索，优先取 operator 精确匹配，其次退到 content 命中。
-        日志按时间倒序，取最新一条。
+        先按 `module=login` 收窄，取 operator 精确匹配的第一条（日志按时间倒序，即最近一次）；
+        没有命中再退到全文检索，兜住 SSH 登录。
         """
         if not username:
             return None, "未提供用户名"
@@ -136,28 +151,24 @@ class UserService:
 
         value: tuple[int | None, str] = (None, "审计日志中没有该用户的登录记录")
         try:
-            raw = await self._c.get(
-                "v1/log/query",
-                {"page": 1, "size": 20, "keyword": username},
-            )
-            fallback = None
-            for row in _rows(raw):
+            for row in await self._log_rows(module="login", keyword=username):
                 ts = row.get("create_time")
-                if not isinstance(ts, (int, float)) or ts <= 0:
-                    continue
-                if (row.get("operator") or "") == username:
+                if isinstance(ts, (int, float)) and ts > 0 and (row.get("operator") or "") == username:
                     value = (int(ts), "log:module=login")
                     break
-                content = str(row.get("content") or "")
-                low = content.lower()
-                if fallback is None and username in content and (
-                    "logged in" in low or "logged into" in low or "login" in low
-                ):
-                    # 兜底：SSH 登录（operator 是 system，用户名在正文里）
-                    fallback = (int(ts), f"log:module={row.get('module') or 'unknown'}")
             else:
-                if fallback:
-                    value = fallback
+                # 兜底：SSH 登录（operator 是 system，用户名在正文里）
+                for row in await self._log_rows(keyword=username):
+                    ts = row.get("create_time")
+                    if not isinstance(ts, (int, float)) or ts <= 0:
+                        continue
+                    content = str(row.get("content") or "")
+                    low = content.lower()
+                    if username in content and (
+                        "logged in" in low or "logged into" in low or "login" in low
+                    ):
+                        value = (int(ts), f"log:module={row.get('module') or 'unknown'}")
+                        break
         except Exception as exc:  # noqa: BLE001 - 日志不可用不影响用户列表
             log.warning("查询 %s 最后登录失败：%s", username, exc)
             value = (None, f"审计日志查询失败：{type(exc).__name__}")

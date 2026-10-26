@@ -63,11 +63,26 @@ def _status_of(item: dict) -> tuple[int | None, str, str]:
     return None, "unknown", "未知"
 
 
+def _to_seconds(value) -> int | None:
+    """时间戳归一成 Unix 秒。
+
+    实测其它接口见过毫秒形态（> 1e11），NAS 若在这里也回毫秒，
+    `now - last` 会得到负数，超期告警将永远不触发。
+    """
+    if not isinstance(value, (int, float)) or isinstance(value, bool) or value <= 0:
+        return None
+    v = float(value)
+    if v > 1e11:
+        v /= 1000.0
+    return int(v)
+
+
 def _pick(item: dict, keys: tuple[str, ...]):
     for k in keys:
         v = item.get(k)
-        if isinstance(v, (int, float)) and v > 0:
-            return int(v)
+        ts = _to_seconds(v)
+        if ts is not None:
+            return ts
     return None
 
 

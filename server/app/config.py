@@ -26,6 +26,9 @@ class Settings(BaseSettings):
     server_host: str = "0.0.0.0"
     server_port: int = 8787
     log_level: str = "INFO"
+    # 受信反向代理（逗号分隔的直连对端 IP）。默认空 = 不信任任何 X-Forwarded-For，
+    # 否则任何人都能伪造该头绕过限流与封禁。
+    trusted_proxies: str = ""
 
     # --- 缓存 TTL（秒）---
     ttl_overview: float = 2.0
@@ -99,7 +102,7 @@ class Settings(BaseSettings):
     benchmark_poll_seconds: float = 3.0
     benchmark_timeout_seconds: int = 1800
     # 测速属写盘操作，默认关闭；开启后接口才允许真正发起测试
-    benchmark_allow_start: bool = True
+    benchmark_allow_start: bool = False
 
     # --- 镜像拉取 ---
     # UGOS 只在镜像列表里暴露“拉取中/已完成”状态，没有字节级进度，只能轮询
@@ -128,6 +131,11 @@ class Settings(BaseSettings):
     @property
     def ugos_base(self) -> str:
         return f"https://{self.ugos_host}:{self.ugos_port}"
+
+    @property
+    def trusted_proxy_list(self) -> tuple[str, ...]:
+        """受信代理 IP 列表（空 = 不信任 X-Forwarded-For）。"""
+        return tuple(x.strip() for x in (self.trusted_proxies or "").split(",") if x.strip())
 
     @property
     def apns_configured(self) -> bool:

@@ -11,6 +11,16 @@ from .nas import NasService
 log = logging.getLogger("snapshot")
 
 
+async def _smart_snapshot(nas: NasService) -> dict:
+    """SMART 数据源：把「明细」与「本轮跳过的盘」一起带回去。
+
+    跳过的盘（休眠中 / 读取失败）没有数据，告警引擎必须知道这一点，
+    否则会把它当成「SMART 已恢复正常」。
+    """
+    items, skipped = await nas.all_smart()
+    return {"items": items, "skipped": skipped}
+
+
 async def gather_snapshot(nas: NasService, health=None, sessions=None, backup=None) -> dict:
     """并发拉取，单个数据源失败不影响其它（该字段降级为空）。
 
@@ -18,7 +28,7 @@ async def gather_snapshot(nas: NasService, health=None, sessions=None, backup=No
     供 `service_down` 规则使用；不传则跳过（总览等场景不需要）。
     `sessions` / `backup` 同理：传入才拉登录失败统计与备份任务列表。
     """
-    calls = [nas.system(), nas.live(), nas.storage(), nas.containers(), nas.all_smart()]
+    calls = [nas.system(), nas.live(), nas.storage(), nas.containers(), _smart_snapshot(nas)]
     names = ["system", "live", "storage", "containers", "smart"]
     if health is not None:
         calls.append(health.services())
@@ -37,7 +47,12 @@ async def gather_snapshot(nas: NasService, health=None, sessions=None, backup=No
         if isinstance(value, BaseException):
             log.warning("数据源 %s 失败：%s", name, value)
             snapshot[name] = empty.get(name, {})
+            if name == "smart":
+                snapshot["smart_skipped"] = []
             snapshot.setdefault("degraded", []).append(name)
+        elif name == "smart":
+            snapshot["smart"] = value.get("items") or []
+            snapshot["smart_skipped"] = value.get("skipped") or []
         else:
             snapshot[name] = value
     snapshot["ts"] = int(time.time())

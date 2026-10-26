@@ -149,6 +149,11 @@ class HealthService:
                 }
             )
 
+        # 进程表偶尔会返回空：此时 present 全 False，若照常判定会一次性把
+        # 11 个守护进程都报成「未运行」。如实标记不可信，告警引擎据此跳过。
+        procs_total = sum(procs.values())
+        reliable = procs_total > 0
+
         return {
             "ugos_services": {
                 "total": ugos.get("total"),
@@ -162,14 +167,15 @@ class HealthService:
                 ],
             },
             "system_processes": {
-                "total": sum(procs.values()),
+                "total": procs_total,
+                "reliable": reliable,
                 "watched": system,
-                "missing": [x["name"] for x in system if not x["present"]],
+                "missing": [x["name"] for x in system if not x["present"]] if reliable else [],
             },
             "docker_engine": engine,
             "required": {
                 "configured": required,
-                "missing": [n for n in required if procs.get(n, 0) == 0],
+                "missing": [n for n in required if procs.get(n, 0) == 0] if reliable else [],
                 "source": "ALERT_REQUIRED_SERVICES",
             },
             "note": "taskmgr/services 只列 UGOS 应用级服务（本机 28 项，无 smbd/nfsd）；"

@@ -25,7 +25,7 @@ import asyncio  # noqa: E402
 
 from app.config import Settings  # noqa: E402
 from app.services.alerts import AlertEngine, _parse_time  # noqa: E402
-from app.services.backup import normalize_task  # noqa: E402
+from app.services.backup import _to_seconds, normalize_task  # noqa: E402
 from app.services.logs import normalize_level  # noqa: E402
 from app.services.powerplan import days_label, normalize_switch  # noqa: E402
 from app.services.sessions import parse_login_record  # noqa: E402
@@ -205,6 +205,13 @@ async def case_backup_stale(s: Settings) -> None:
     check("既没上次运行时间也没计划时间 → 静默跳过（不自造数据）",
           "backup_task_stale:9" not in keys(ev), str(keys(ev)))
 
+    # 毫秒形态：不归一的话 now - last 是负数，超期告警会永远不触发
+    ms_task = normalize_task({"id": 11, "task_name": "毫秒任务", "status": 0,
+                              "last_run_time": int(now - 3600 * 72) * 1000})
+    ev = await eng.evaluate(snap(backup={"items": [ms_task]}))
+    check("毫秒形态的上次运行时间仍能判超期",
+          keys(ev).get("backup_task_stale:11") == "raised", str(keys(ev)))
+
 
 async def case_backup_degraded(s: Settings) -> None:
     print("\n[5] 备份数据源降级")
@@ -257,6 +264,14 @@ def case_parsers(s: Settings) -> None:
     check("路径字段", t["local_paths"] == ["/volume1/a"], str(t["local_paths"]))
     t2 = normalize_task({"id": 4, "status": "error"})
     check("字符串状态 error → 失败", t2["failed"] is True and t2["status_code"] == 1, t2["status"])
+
+    print("\n[8b] 时间戳秒/毫秒归一")
+    check("毫秒时间戳 → 秒", _to_seconds(1792976494123) == 1792976494)
+    check("秒级时间戳不变", _to_seconds(1792976494) == 1792976494)
+    check("非法值返回 None", _to_seconds("x") is None and _to_seconds(0) is None
+          and _to_seconds(None) is None)
+    t3 = normalize_task({"id": 5, "status": 0, "last_run_time": 1792976494123})
+    check("normalize_task 统一归一成秒", t3["last_run_at"] == 1792976494, str(t3["last_run_at"]))
 
     print("\n[9] 电源计划星期映射")
     check("1-5 → 工作日", days_label([1, 2, 3, 4, 5]) == "工作日")

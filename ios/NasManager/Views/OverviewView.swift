@@ -14,6 +14,10 @@ struct OverviewView: View {
     var body: some View {
         NavigationStack {
             List {
+                if !model.partialErrors.isEmpty {
+                    partialErrorSection
+                }
+
                 if let firmware = model.firmware, firmware.hasUpdate,
                    let latest = firmware.publishVersion,
                    dismissedFirmwareVersion != latest {
@@ -56,6 +60,36 @@ struct OverviewView: View {
     }
 
     // MARK: 区块
+
+    /// 部分数据源加载失败：列表为空时不能让人误以为设备上真的没有磁盘/容器
+    @ViewBuilder
+    private var partialErrorSection: some View {
+        Section {
+            HStack(alignment: .top, spacing: 10) {
+                Image(systemName: "exclamationmark.triangle.fill")
+                    .foregroundStyle(.orange)
+                VStack(alignment: .leading, spacing: 3) {
+                    Text("部分数据未加载")
+                        .font(.subheadline.weight(.medium))
+                    Text(model.partialErrors.joined(separator: "、"))
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
+                Spacer(minLength: 0)
+                Button {
+                    model.partialErrors.removeAll()
+                } label: {
+                    Image(systemName: "xmark.circle.fill")
+                        .foregroundStyle(.tertiary)
+                }
+                .buttonStyle(.plain)
+            }
+            .padding(.vertical, 2)
+            .listRowBackground(Color.orange.opacity(0.12))
+        } footer: {
+            Text("下方空列表表示读取失败，不代表设备上真的没有。下拉可重试。")
+        }
+    }
 
     /// 固件更新提示条，只提醒不做升级
     @ViewBuilder

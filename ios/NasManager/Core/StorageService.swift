@@ -23,8 +23,8 @@ struct SMARTInfo {
 
 /// 存储相关：SMART 明细。
 ///
-/// `v1/storage/disk/smart/info` 必须带磁盘参数，否则回 code 9999（踩坑第 14 条）。
-/// 具体参数名各固件不一致，按 name / disk / disk_name 依次兜底。
+/// `v1/storage/disk/smart/info` 的 `disk` 参数**必须是 dev_name**（形如 `/dev/sda`），
+/// 传裸盘名 `sda` / 标签「硬盘1」一律回 `5001 硬盘不存在`（踩坑第 14 条）。
 final class StorageService {
     private let client: UgosClient
 
@@ -34,29 +34,32 @@ final class StorageService {
 
     func smartInfo(for disk: Disk) async throws -> SMARTInfo {
         var identifiers: [String] = []
-        if let name = disk.name, !name.isEmpty {
-            identifiers.append(name)
+        if let dev = disk.devName?.trimmingCharacters(in: .whitespacesAndNewlines), !dev.isEmpty {
+            identifiers.append(dev)
         }
-        if let label = disk.label, !label.isEmpty, !identifiers.contains(label) {
-            identifiers.append(label)
+        if let name = disk.name?.trimmingCharacters(in: .whitespacesAndNewlines), !name.isEmpty {
+            let dev = name.hasPrefix("/dev/") ? name : "/dev/" + name
+            if !identifiers.contains(dev) { identifiers.append(dev) }
         }
 
-        var lastError: Error = UgosError.decoding("磁盘缺少可用标识，无法查询 SMART")
+        guard !identifiers.isEmpty else {
+            throw UgosError.auth("该磁盘缺少设备名，无法查询 SMART")
+        }
+
+        var lastError: Error = UgosError.decoding("SMART 返回内容为空")
         for identifier in identifiers {
-            for key in ["name", "disk", "disk_name"] {
-                do {
-                    let data = try await client.get(
-                        "v1/storage/disk/smart/info",
-                        params: [key: identifier]
-                    )
-                    let info = SMARTInfo.parse(data)
-                    if !info.isEmpty {
-                        return info
-                    }
-                    lastError = UgosError.decoding("SMART 返回内容为空")
-                } catch {
-                    lastError = error
+            do {
+                let data = try await client.get(
+                    "v1/storage/disk/smart/info",
+                    params: ["disk": identifier]
+                )
+                let info = SMARTInfo.parse(data)
+                if !info.isEmpty {
+                    return info
                 }
+                lastError = UgosError.decoding("SMART 返回内容为空")
+            } catch {
+                lastError = error
             }
         }
         throw lastError

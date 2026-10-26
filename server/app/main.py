@@ -39,6 +39,22 @@ from .ugos.client import UgosAuthRequired, UgosClient, UgosError
 
 log = logging.getLogger("main")
 
+# 巡检覆盖的核心数据源：全部降级 = NAS 事实上不可用
+CORE_SOURCES = ("system", "live", "storage", "containers", "smart")
+
+
+def judge_reachable(degraded) -> bool:
+    """按本轮降级的数据源判断 UGOS 是否可达。
+
+    `gather_snapshot` 里是 `return_exceptions=True`，数据源异常不会抛出来，
+    所以「没抛异常」不能当作 NAS 活着——必须看降级清单。
+    """
+    down = {str(x) for x in (degraded or [])}
+    if set(CORE_SOURCES) <= down:
+        return False
+    # 设备信息与实时指标同时取不到：基本是掉线或会话崩了
+    return not {"system", "live"} <= down
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -67,9 +83,9 @@ async def lifespan(app: FastAPI):
     app.state.images = ImageManager(app.state.nas, settings)
     app.state.snapshots = SnapshotService(app.state.nas, app.state.cache, settings)
     app.state.history = HistoryRecorder(app.state.nas, settings)
-    app.state.users = UserService(app.state.nas, app.state.cache, settings)
-    app.state.health = HealthService(app.state.nas, settings)
     app.state.logs = LogService(app.state.nas, app.state.cache, settings)
+    app.state.users = UserService(app.state.nas, app.state.cache, settings, app.state.logs)
+    app.state.health = HealthService(app.state.nas, settings)
     app.state.sessions = SessionService(app.state.nas, app.state.cache, settings, app.state.logs)
     app.state.fans = FanService(app.state.nas, app.state.cache, settings)
     app.state.backup = BackupService(app.state.nas, app.state.cache, settings)
@@ -78,6 +94,7 @@ async def lifespan(app: FastAPI):
     app.state.ugos_reachable = False
     app.state.last_poll_ok = False
     app.state.last_poll_at = 0
+    app.state.degraded = []
 
     configured_token = settings.api_token
     token = settings.resolve_api_token()
@@ -109,9 +126,14 @@ async def lifespan(app: FastAPI):
                     app.state.nas, app.state.health, app.state.sessions, app.state.backup
                 )
                 events = await app.state.alerts.evaluate(snapshot)
-                app.state.ugos_reachable = True
+                degraded = list(snapshot.get("degraded") or [])
+                app.state.degraded = degraded
+                # 只有真正取到数据才算可达；全降级 / system+live 同时降级视为不可达
+                app.state.ugos_reachable = judge_reachable(degraded)
                 app.state.last_poll_ok = True
                 app.state.last_poll_at = int(time.time())
+                if degraded:
+                    log.warning("本轮降级数据源：%s", "、".join(degraded))
                 if events:
                     log.info("巡检状态变化 %d 条", len(events))
                     for ev in events:
@@ -120,6 +142,8 @@ async def lifespan(app: FastAPI):
                 raise
             except Exception:  # noqa: BLE001 - 巡检不能因单次失败退出
                 app.state.last_poll_ok = False
+                app.state.ugos_reachable = False
+                app.state.degraded = ["poll_failed"]
                 log.exception("巡检失败")
             await asyncio.sleep(max(10, settings.poll_interval))
 

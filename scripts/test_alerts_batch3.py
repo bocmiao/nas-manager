@@ -124,6 +124,22 @@ async def case_suppress(s: Settings) -> None:
                                               "status": "exited", "image": "w"}]))
     check("被 suppress 的容器不产生事件", keys(ev) == {}, str(keys(ev)))
 
+    # 用户主动停止时，已存在的告警必须收尾（否则 App 永远收不到「已恢复」）
+    eng2 = AlertEngine(s)
+    for _ in range(3):
+        await eng2.evaluate(snap(containers=c))
+    stopped = [{"name": "app", "running": False, "status": "exited", "image": "w"}]
+    await eng2.evaluate(snap(containers=stopped))
+    ev = await eng2.evaluate(snap(containers=stopped))
+    check("先制造 container_expected_down",
+          keys(ev).get("container_expected_down:app") == "raised", str(keys(ev)))
+    events = eng2.suppress("app", True)
+    check("suppress 撤回告警并给出 resolved 事件",
+          keys(events).get("container_expected_down:app") == "resolved", str(keys(events)))
+    check("告警已从 active 移除",
+          not any(a.key.startswith(("container_down:app", "container_expected_down:app"))
+                  for a in eng2.active()))
+
 
 async def case_disk_wake(s: Settings) -> None:
     print("\n[5] 磁盘频繁唤醒：窗口内 6 次 → 告警，停止唤醒 → 恢复")
@@ -201,6 +217,86 @@ async def case_inode_and_nic(s: Settings) -> None:
     check("无 inode 数据时不误报", "volume_inode:v" not in keys(ev), str(keys(ev)))
 
 
+async def case_degraded_no_reset(s: Settings) -> None:
+    """数据源降级时只能「不新增不恢复」，绝不能把基线当成故障消失。
+
+    这是最容易失守的一条：降级时用空列表去评估相对量规则，清理循环会把基线全删，
+    于是「容器挂了」在抖动一次之后就永久不再报警。
+    """
+    print("\n[8] 数据源降级不清基线（容器 / 网口 / SMART / 服务）")
+    eng = AlertEngine(s)
+    c = [{"name": "qb", "running": True, "status": "running", "image": "x"}]
+    stopped = [{"name": "qb", "running": False, "status": "exited", "image": "x"}]
+    for _ in range(3):
+        await eng.evaluate(snap(containers=c))
+    await eng.evaluate(snap(containers=stopped))
+    ev = await eng.evaluate(snap(containers=stopped))
+    check("先制造 container_expected_down",
+          keys(ev).get("container_expected_down:qb") == "raised", str(keys(ev)))
+
+    ev = await eng.evaluate({**snap(containers=[]), "degraded": ["containers"]})
+    check("容器降级时不发 resolved（取不到≠已恢复）", keys(ev) == {}, str(keys(ev)))
+    check("容器降级后「期望运行」基线仍在",
+          any(i["name"] == "qb" for i in eng.container_baseline()["items"]),
+          str(eng.container_baseline()["items"]))
+    check("容器降级后告警仍在 active",
+          any(a.key == "container_expected_down:qb" for a in eng.active()))
+
+    ev = await eng.evaluate(snap(containers=stopped))
+    check("数据恢复后不重复 raise", keys(ev) == {}, str(keys(ev)))
+    ev = await eng.evaluate(snap(containers=c))
+    check("真正恢复运行 → resolved",
+          keys(ev).get("container_expected_down:qb") == "resolved", str(keys(ev)))
+
+    # 网口：降级时不能把 active 的 nic_errors 判成恢复
+    eng2 = AlertEngine(s)
+    n0 = [{"name": "eth0", "speed_mbps": 2500, "rx_errors": 0}]
+    await eng2.evaluate(snap(nics=n0))
+    n1 = [{"name": "eth0", "speed_mbps": 2500, "rx_errors": s.alert_nic_error_delta + 1}]
+    ev = await eng2.evaluate(snap(nics=n1))
+    check("先制造 nic_errors", keys(ev).get("nic_errors:eth0") == "raised", str(keys(ev)))
+    ev = await eng2.evaluate({**snap(nics=[]), "degraded": ["system"]})
+    check("网口降级时不判恢复", keys(ev) == {}, str(keys(ev)))
+    ev = await eng2.evaluate(snap(nics=[{"name": "eth0", "speed_mbps": 1000, "duplex": "full"}]))
+    check("降级后仍按历史峰值 2500 Mbps 判降速",
+          keys(ev).get("nic_speed:eth0") == "raised", str(keys(ev)))
+
+    # SMART：休眠盘没有数据，不能当成「已恢复正常」
+    eng3 = AlertEngine(s)
+    bad = snap()
+    bad["smart"] = [{"supported": True, "disk": {"name": "sda", "label": "硬盘1"},
+                     "counters": {"reallocated_sectors": 8},
+                     "key_items": {"power_on_hours": 1200}, "health": "ok"}]
+    ev = await eng3.evaluate(bad)
+    check("有重映射扇区 → disk_smart raised",
+          keys(ev).get("disk_smart:sda") == "raised", str(keys(ev)))
+    skipped = snap()
+    skipped["smart"] = []
+    skipped["smart_skipped"] = ["sda"]
+    ev = await eng3.evaluate(skipped)
+    check("休眠盘本轮无 SMART 数据 → 不判恢复", keys(ev) == {}, str(keys(ev)))
+    check("SMART 告警仍在 active",
+          any(a.key == "disk_smart:sda" for a in eng3.active()))
+    ev = await eng3.evaluate(bad)
+    check("唤醒后不重复 raise", keys(ev) == {}, str(keys(ev)))
+
+    # 服务：进程表空 → 不可信，不能一次性把十几个守护进程判成未运行
+    eng4 = AlertEngine(s)
+    for _ in range(s.alert_service_expected_polls):
+        await eng4.evaluate(snap(procs={"smbd": True}))
+    ev = await eng4.evaluate(snap(procs={"smbd": False}))
+    check("先制造 service_down", keys(ev).get("service_down:smbd") == "raised", str(keys(ev)))
+    empty = snap(procs={})
+    empty["service_health"]["system_processes"]["reliable"] = False
+    ev = await eng4.evaluate(empty)
+    check("进程表为空 → 不新增也不撤销服务告警",
+          keys(ev) == {} and any(a.key == "service_down:smbd" for a in eng4.active()),
+          str(keys(ev)))
+    ev = await eng4.evaluate(snap(procs={"smbd": True}))
+    check("进程表恢复且服务在跑 → resolved",
+          keys(ev).get("service_down:smbd") == "resolved", str(keys(ev)))
+
+
 async def main() -> int:
     s = Settings(
         alert_disk_wake_count=6,
@@ -219,6 +315,7 @@ async def main() -> int:
     await case_disk_wake(s)
     await case_service(s)
     await case_inode_and_nic(s)
+    await case_degraded_no_reset(s)
 
     failed = [r for r in results if r[0] == FAIL]
     print(f"\n{'=' * 50}\n{len(results) - len(failed)}/{len(results)} 通过")

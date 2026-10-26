@@ -103,7 +103,7 @@ final class BackupService {
                     statusCode: code,
                     statusText: BackupService.statusText(code: code, raw: rawStatus),
                     typeText: BackupService.typeText(LogService.int(item["backup_type"])),
-                    progress: LogService.int(item["progress"]),
+                    progress: BackupService.progressPercent(item["progress"]),
                     lastRun: lastRun,
                     nextRun: nextRun,
                     detail: detailParts.isEmpty ? nil : detailParts.joined(separator: " → ")
@@ -159,6 +159,25 @@ final class BackupService {
         guard let seconds, seconds > 0 else { return nil }
         let value = seconds > 1_000_000_000_000 ? Double(seconds) / 1000 : Double(seconds)
         return Date(timeIntervalSince1970: value)
+    }
+
+    /// 进度统一成 0~100 的整数。
+    /// 后端对 `0 <= progress <= 1` 的浮点给的是比例（0.42 = 42%），
+    /// 直接用 `Int()` 会截成 0，必须先乘 100 再钳位。
+    static func progressPercent(_ any: Any?) -> Int? {
+        guard let any else { return nil }
+        let raw: Double?
+        if let number = any as? NSNumber {
+            raw = number.doubleValue
+        } else if let text = any as? String {
+            raw = Double(text.trimmingCharacters(in: .whitespacesAndNewlines))
+        } else {
+            raw = nil
+        }
+        guard let value = raw, value.isFinite else { return nil }
+        let percent = value <= 1 ? value * 100 : value
+        // 先钳位再转 Int，避免极端值在 Int() 处溢出崩溃
+        return Int(min(max(percent, 0), 100).rounded())
     }
 
     /// 路径字段可能是字符串也可能是数组，两种都能展示

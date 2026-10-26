@@ -551,26 +551,33 @@ class NasService:
             "badblocks_by_month": raw.get("key_datas") or [],
         }
 
-    async def all_smart(self) -> list[dict]:
-        """巡检用：批量取所有支持 SMART 的磁盘，单盘失败不影响其它。
+    async def all_smart(self) -> tuple[list[dict], list[str]]:
+        """巡检用：批量取所有支持 SMART 的磁盘，返回 `(明细, 本轮跳过的盘名)`。
 
         **休眠中的盘直接跳过**：读 SMART 需要盘转起来，对 `is_standby=true` 的盘取
         SMART 相当于由中间层自己把盘唤醒，会让用户的休眠策略彻底失效。
         代价是休眠期间的 SMART 数据停在旧值（温度等），恢复工作后自动更新。
+
+        跳过的盘（休眠 + 单盘读取失败）单独返回：调用方知道「本轮没有数据」，
+        才能做到既不新增也不恢复告警。
         """
         disks = (await self.storage()).get("disks") or []
         out: list[dict] = []
+        skipped: list[str] = []
         for d in disks:
+            name = d.get("name") or ""
             if not d.get("support_smart"):
                 continue
             if d.get("standby"):
-                log.debug("%s 处于休眠，跳过 SMART 以免唤醒", d.get("name"))
+                log.debug("%s 处于休眠，跳过 SMART 以免唤醒", name)
+                skipped.append(name)
                 continue
             try:
-                out.append(await self.disk_smart(d.get("name") or ""))
+                out.append(await self.disk_smart(name))
             except Exception as exc:  # noqa: BLE001 - 单盘失败降级
-                log.warning("读取 %s SMART 失败：%s", d.get("name"), exc)
-        return out
+                log.warning("读取 %s SMART 失败：%s", name, exc)
+                skipped.append(name)
+        return out, skipped
 
     # ------------------------------------------------------------------ 容器
 
@@ -628,11 +635,27 @@ class NasService:
             raise ValueError(f"不支持的操作：{action}")
         if not container_id or len(container_id) < 8:
             raise ValueError("containerId 非法")
+        # 反查容器名要给告警引擎用：用户在 App 里停的容器不该被报成「非用户主动停止」。
+        # 必须在动作前查（动作后缓存已被失效，会重新拉一次且已是停止状态）。
+        name = None
+        try:
+            name = next(
+                (c.get("name") for c in await self.containers() if c.get("id") == container_id),
+                None,
+            )
+        except Exception as exc:  # noqa: BLE001 - 反查失败不影响动作本身
+            log.warning("反查容器名失败：%s", exc)
+
         data = await self._c.get(
             f"v1/docker/container/{endpoint}", {"containerId": container_id}
         )
         self._cache.invalidate("containers")
-        return {"action": action, "container_id": container_id, "result": data}
+        return {
+            "action": action,
+            "container_id": container_id,
+            "container_name": name,
+            "result": data,
+        }
 
     async def container_logs(self, container_id: str, tail: int = 200,
                              keyword: str = "", stream: str = "") -> dict:

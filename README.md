@@ -156,7 +156,9 @@ python -m uvicorn app.main:app --reload
 python scripts/nas_login_test.py <user> <password>   # 验证登录链路
 python scripts/probe_endpoints.py                     # 批量探测端点
 python scripts/probe_batch4.py all                    # 第四批探测：会话 / 风扇 / 备份 / 电源 / 日志 / 虚拟机
-python scripts/test_alerts_batch4.py                  # 告警规则合成数据验证（50 项）
+python scripts/test_alerts_batch3.py                  # 容器基线 / 服务 / 网口规则验证（41 项）
+python scripts/test_alerts_batch4.py                  # 登录失败 / 备份 / 解析函数验证（55 项）
+python scripts/test_degraded_snapshot.py              # 数据源降级：不误报恢复、reachable 判定（23 项）
 ```
 
 凭据只从环境变量或 `.env` 读取，仓库内不含任何真实设备信息。

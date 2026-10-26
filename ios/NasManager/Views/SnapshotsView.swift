@@ -254,32 +254,47 @@ struct SnapshotsView: View {
 
 // MARK: - 新建
 
-/// 新建快照：选卷 + 备注
+/// 新建快照：选快照文件夹 + 备注
+///
+/// 目标必须来自 `snapshotFolders`（`folderType|folderId`），不能用卷名——
+/// 快照按文件夹创建，卷名匹配不到时会被服务端落到别的文件夹上。
 struct CreateSnapshotSheet: View {
     let model: AppModel
 
     @Environment(\.dismiss) private var dismiss
 
-    @State private var volume = ""
+    @State private var folderId = ""
     @State private var remark = ""
     @State private var isSaving = false
+    @State private var isLoadingFolders = false
     @State private var errorText: String?
 
-    private var volumes: [Volume] {
-        model.dashboard?.volumes ?? []
+    private var folders: [SnapshotFolder] { model.snapshotFolders }
+
+    private var selectedFolder: SnapshotFolder? {
+        folders.first { $0.id == folderId }
     }
 
     var body: some View {
         NavigationStack {
             Form {
                 Section {
-                    if volumes.isEmpty {
-                        EmptyHint(text: "未读取到卷，无法创建快照")
+                    if folders.isEmpty {
+                        if isLoadingFolders {
+                            HStack(spacing: 8) {
+                                ProgressView()
+                                Text("正在读取可快照的文件夹…")
+                                    .font(.footnote)
+                                    .foregroundStyle(.secondary)
+                            }
+                        } else {
+                            EmptyHint(text: "没有可快照的文件夹（需要 Btrfs 文件系统，且至少有一个共享文件夹或家目录）")
+                        }
                     } else {
-                        Picker("所属卷", selection: $volume) {
-                            ForEach(volumes) { item in
-                                Text(item.label ?? item.name ?? "-")
-                                    .tag(item.name ?? item.label ?? "-")
+                        Picker("目标文件夹", selection: $folderId) {
+                            ForEach(folders) { folder in
+                                Text("\(folder.displayName) · \(folder.typeLabel)")
+                                    .tag(folder.id)
                             }
                         }
                     }
@@ -287,7 +302,7 @@ struct CreateSnapshotSheet: View {
                 } header: {
                     Text("新建快照")
                 } footer: {
-                    Text("快照占用卷内空间，耗时任数据量而定。")
+                    Text("快照按文件夹创建，会占用所在卷的空间，耗时与数据量相关。")
                 }
 
                 if let errorText {
@@ -315,12 +330,17 @@ struct CreateSnapshotSheet: View {
                             Text("创建")
                         }
                     }
-                    .disabled(isSaving || volume.isEmpty)
+                    .disabled(isSaving || selectedFolder == nil)
                 }
             }
-            .onAppear {
-                if volume.isEmpty {
-                    volume = volumes.first?.name ?? volumes.first?.label ?? ""
+            .task {
+                if model.snapshotFolders.isEmpty {
+                    isLoadingFolders = true
+                    _ = await model.snapshots()
+                    isLoadingFolders = false
+                }
+                if folderId.isEmpty {
+                    folderId = model.snapshotFolders.first?.id ?? ""
                 }
             }
         }
@@ -328,11 +348,11 @@ struct CreateSnapshotSheet: View {
 
     @MainActor
     private func create() async {
-        guard !volume.isEmpty else { return }
+        guard let folder = selectedFolder else { return }
         isSaving = true
         errorText = nil
         do {
-            try await model.createSnapshot(volume: volume, remark: remark)
+            try await model.createSnapshot(folder: folder, remark: remark)
             dismiss()
         } catch {
             errorText = error.localizedDescription

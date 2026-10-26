@@ -96,6 +96,9 @@ final class AppModel {
     /// 最近一次拉到的可快照文件夹，创建快照时作为目标候选
     var snapshotFolders: [SnapshotFolder] = []
 
+    /// 部分数据源加载失败的说明。空数组表示全部成功，界面据此区分「真的没有」和「没读到」
+    var partialErrors: [String] = []
+
     init() {
         let defaults = UserDefaults.standard
         let storedHost = defaults.string(forKey: SettingsKeys.internalHost)
@@ -240,6 +243,9 @@ final class AppModel {
         powerPlanService = nil
         dashboard = nil
         lastUpdated = nil
+        // 切服务器后必须清空，否则会拿上一台 NAS 的 folder_id 去建快照
+        snapshotFolders = []
+        partialErrors = []
         activeLabel = nil
         activeDisplay = nil
         activeHost = nil
@@ -271,29 +277,63 @@ final class AppModel {
         defer { isLoading = false }
 
         var result = Dashboard()
-        // 单个接口失败不影响其他卡片
-        result.machine = try? await client.getDecodable(
-            MachineInfo.self, path: "v1/sysinfo/machine/common"
-        )
-        result.live = try? await client.getDecodable(
-            LiveOverview.self, path: "v1/taskmgr/stat/overview"
-        )
-        result.disks = (try? await client.getDecodable(
-            DiskList.self, path: "v2/storage/disk/list"
-        ))?.result ?? []
-        result.pools = (try? await client.getDecodable(
-            PoolList.self, path: "v1/storage/pool/list"
-        ))?.result ?? []
-        result.volumes = (try? await client.getDecodable(
-            VolumeList.self, path: "v1/storage/volume/list"
-        ))?.result ?? []
+        var failures: [String] = []
+
+        // 单个接口失败不影响其他卡片，但失败原因要记下来：
+        // 空数组只能代表「真的没有」，不能替「没读到」背锅
+        do {
+            result.machine = try await client.getDecodable(
+                MachineInfo.self, path: "v1/sysinfo/machine/common"
+            )
+        } catch {
+            result.machine = nil
+            failures.append("设备信息加载失败")
+        }
+        do {
+            result.live = try await client.getDecodable(
+                LiveOverview.self, path: "v1/taskmgr/stat/overview"
+            )
+        } catch {
+            result.live = nil
+            failures.append("实时负载加载失败")
+        }
+        do {
+            result.disks = (try await client.getDecodable(
+                DiskList.self, path: "v2/storage/disk/list"
+            )).result ?? []
+        } catch {
+            result.disks = []
+            failures.append("磁盘列表加载失败")
+        }
+        do {
+            result.pools = (try await client.getDecodable(
+                PoolList.self, path: "v1/storage/pool/list"
+            )).result ?? []
+        } catch {
+            result.pools = []
+            failures.append("存储池列表加载失败")
+        }
+        do {
+            result.volumes = (try await client.getDecodable(
+                VolumeList.self, path: "v1/storage/volume/list"
+            )).result ?? []
+        } catch {
+            result.volumes = []
+            failures.append("卷列表加载失败")
+        }
         if let docker = docker {
-            result.containers = (try? await docker.containers()) ?? []
+            do {
+                result.containers = try await docker.containers()
+            } catch {
+                result.containers = []
+                failures.append("容器列表加载失败")
+            }
         }
 
         if result.machine == nil && result.live == nil {
             consecutiveFailures += 1
             errorMessage = "未能读取到设备信息，请检查网络或固件版本"
+            partialErrors = []
             // 连续失败时尝试换另一个地址（例如离开家里的 Wi-Fi）
             if consecutiveFailures >= 2 {
                 await switchToAlternateAddress()
@@ -305,6 +345,7 @@ final class AppModel {
         dashboard = result
         lastUpdated = Date()
         errorMessage = nil
+        partialErrors = failures
         if let live = result.live {
             metrics.record(live: live)
         }
@@ -495,17 +536,9 @@ final class AppModel {
     }
 
     @MainActor
-    func createSnapshot(volume: String, remark: String) async throws {
+    func createSnapshot(folder: SnapshotFolder, remark: String) async throws {
         guard let snapshotService = snapshotService else { throw UgosError.auth("尚未连接") }
-        // 没有缓存的文件夹列表时先拉一次，避免创建时选不到目标
-        if snapshotFolders.isEmpty {
-            let result = await snapshotService.list()
-            snapshotFolders = result.folders
-            guard result.available else {
-                throw UgosError.auth(result.message ?? "该存储不支持快照")
-            }
-        }
-        try await snapshotService.create(volumeName: volume, remark: remark, folders: snapshotFolders)
+        try await snapshotService.create(folder: folder, comment: remark)
     }
 
     @MainActor

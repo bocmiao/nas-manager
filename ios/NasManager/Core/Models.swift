@@ -198,6 +198,8 @@ struct Disk: Decodable, Identifiable {
     let model: String?
     let label: String?
     let name: String?
+    /// 内核设备名，形如 `/dev/sda`；SMART / 测速等接口只认这个
+    let devName: String?
     let brand: String?
     let size: UInt64?
     let temperature: Int?
@@ -212,6 +214,7 @@ struct Disk: Decodable, Identifiable {
 
     enum CodingKeys: String, CodingKey {
         case model, label, name, brand, size, temperature, status
+        case devName = "dev_name"
         case powerOnHours = "power_on_hours"
         case usedFor = "used_for"
     }

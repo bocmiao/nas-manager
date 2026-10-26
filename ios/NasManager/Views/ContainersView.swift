@@ -224,7 +224,7 @@ struct ContainerLogSheet: View {
 
     @Environment(\.dismiss) private var dismiss
     @State private var lineCount = 200
-    @State private var content = ""
+    @State private var lines: [String] = []
     @State private var errorText: String?
     @State private var isLoading = false
 
@@ -233,7 +233,7 @@ struct ContainerLogSheet: View {
     var body: some View {
         NavigationStack {
             Group {
-                if isLoading && content.isEmpty {
+                if isLoading && lines.isEmpty {
                     ProgressView("读取日志…")
                 } else if let errorText = errorText {
                     VStack(spacing: 10) {
@@ -252,11 +252,16 @@ struct ContainerLogSheet: View {
                     .padding()
                 } else {
                     ScrollView {
-                        Text(content)
-                            .font(.system(.caption, design: .monospaced))
-                            .textSelection(.enabled)
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                            .padding(12)
+                        // 全量日志可能有几十 MB，必须逐行懒加载，不能塞进一个 Text
+                        LazyVStack(alignment: .leading, spacing: 2) {
+                            ForEach(lines.indices, id: \.self) { index in
+                                Text(lines[index])
+                                    .font(.system(.caption, design: .monospaced))
+                                    .textSelection(.enabled)
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                            }
+                        }
+                        .padding(12)
                     }
                     .refreshable { await load() }
                 }
@@ -293,7 +298,9 @@ struct ContainerLogSheet: View {
                 containerId: container.containerId ?? "",
                 tail: lineCount
             )
-            content = text.isEmpty ? "暂无日志" : text
+            // 服务层已解帧并按 tail 截断，这里只拆成行给 LazyVStack 用
+            let parsed = text.split(separator: "\n", omittingEmptySubsequences: true).map { String($0) }
+            lines = parsed.isEmpty ? ["暂无日志"] : parsed
         } catch {
             errorText = error.localizedDescription
         }

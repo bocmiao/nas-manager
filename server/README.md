@@ -39,6 +39,10 @@ Authorization: Bearer <API_TOKEN>
 
 失败累计 10 次封禁来源 IP 300 秒，默认限流 240 次/分钟。
 
+来源 IP 取 TCP 直连对端；**只有**对端在 `TRUSTED_PROXIES`（逗号分隔）里时才采信
+`X-Forwarded-For`，否则该头一律忽略——默认 `SERVER_HOST=0.0.0.0`，信任可伪造的头
+等于让限流与封禁失效。
+
 响应统一：
 
 ```json
@@ -56,7 +60,7 @@ Authorization: Bearer <API_TOKEN>
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
-| GET | `/health` | 无需鉴权。含 `ugos.reachable` / `authenticated` / `last_poll_ok` / 推送状态，供外部 uptime 监控 |
+| GET | `/health` | 无需鉴权。含 `ugos.reachable`（按本轮降级数据源判定）/ `authenticated` / `last_poll_ok` / `degraded`（取不到的数据源列表）/ 推送状态，供外部 uptime 监控 |
 
 ### 系统与总览
 
@@ -122,7 +126,7 @@ Authorization: Bearer <API_TOKEN>
 | 方法 | 路径 | 说明 |
 |---|---|---|
 | GET | `/api/v1/docker/images` | **镜像列表**：标签 / 大小 / 创建时间 / 被哪些容器引用 |
-| DELETE | `/api/v1/docker/images?ids=a&ids=b` | **删除镜像**，1 个走单个接口、多个自动走批量接口。`ids` 可用 `sha256:…` / `name:tag` / 镜像名 |
+| DELETE | `/api/v1/docker/images?ids=a&ids=b` | **删除镜像**，1 个走单个接口、多个自动走批量接口。`ids` 可用 `sha256:…` / `name:tag` / 镜像名。删完重新列表校验，返回 `verified` / `still_present`；被容器引用时默认 403，需 `force=true` |
 | POST | `/api/v1/docker/images/pull` | **拉取镜像**，202 + 任务对象，body `{"name":"nginx","tag":"latest"}` |
 | GET | `/api/v1/docker/images/pull?ref=nginx:latest` | 查拉取任务状态与进度 |
 | GET | `/api/v1/docker/images/pulls` | 本进程发起的所有拉取任务 |
@@ -195,6 +199,8 @@ Authorization: Bearer <API_TOKEN>
 - 接口是「发起 + 轮询」模型，中间层包成本地异步任务：`POST` 立刻返回 202，后台协程每 3 秒查一次进度，前端轮询 `GET` 即可。
 - **在用磁盘不能测速**：NAS 返回 `9999` + `debug="disk is busy: 1"`，中间层转成 HTTP 409 并附中文 `hint`。
 - 可用 `BENCHMARK_ALLOW_START=false` 在服务端整体关掉这个能力。
+- **默认就是关闭的**（`BENCHMARK_ALLOW_START` 默认 `false`）：测速会向目标盘写入测试数据，
+  **开启前先确认目标盘没有数据**。开启后仍需二次密码校验。
 
 ## 容器日志
 
@@ -221,8 +227,10 @@ Authorization: Bearer <API_TOKEN>
   `progress` 字段实测恒为 0，所以中间层只能报「进行中 / 完成 / 失败」，不编造百分比。
 - 中间层把拉取包成异步任务：`POST /docker/images/pull` 立刻返回 202，后台每 3 秒轮询一次列表，
   客户端轮询 `GET /docker/images/pull?ref=` 拿状态。镜像已存在时直接返回 `succeeded` 并注明未重复拉取。
-- **删除要自己校验存在性**：UGOS 对不存在的镜像同样返回 `successful`，所以中间层先列一次做校验，
-  响应里 `deleted` / `missing` 分列。`BatchDeleteImage` 的 `imageIds` 必须是**对象数组**
+- **删除要自己校验**：UGOS 对不存在的镜像、以及被停止容器引用（Docker 拒绝删除）的镜像
+  同样返回 `successful`。中间层因此做两道关：先列一次做存在性校验、`in_use` 非空时默认拒绝
+  （需显式 `force=true`）；删完**再列一次**核对，响应里给 `verified` 与 `still_present`，
+  `deleted` 只包含确认已消失的条目。`BatchDeleteImage` 的 `imageIds` 必须是**对象数组**
   （`{id,status,imageName,imageVersion}`），传字符串数组会报 `cannot unmarshal string ...`。
 - 「关联容器数」用 `QueryAllContaners`（body `{"list":[{imageId,imageRef}]}`）一次批量查，
   返回 `{result:[{imageId,names:[容器名]}]}`；没有容器引用时返回 `{}`。
@@ -473,6 +481,8 @@ python sentinel.py --url ... --webhook ... --once
 - `--nas host:port` 额外做一次 TCP + TLS 握手，用来区分「中间层挂了」和「整机挂了」。
 - 只在**状态跳变**时发 webhook（故障发一次、恢复发一次），持续异常不重复。状态存 `--state-file`。
 - webhook 支持 `json`（默认）和 `text` 两种体格式，`--webhook-header K:V` 可加鉴权头。
+- 证书校验分两种：对**被监控目标**（自签 NAS）跳过校验；发 **webhook** 走标准校验，
+  避免被假证书截获内网信息或伪造「已恢复」。
 - 退出码：0 正常，2 参数错误，130 被中断。
 
 ---

@@ -124,7 +124,6 @@ class AlertEngine:
 
     def _evaluate(self, snapshot: dict) -> dict[str, Alert]:
         found: dict[str, Alert] = {}
-        s = self._s
         now = time.time()
 
         storage = snapshot.get("storage") or {}
@@ -136,7 +135,12 @@ class AlertEngine:
         found.update(self._check_volumes(storage, now))
         found.update(self._check_host(live, now))
         found.update(self._check_ups(system.get("ups") or {}, now))
-        found.update(self._check_smart(snapshot.get("smart") or [], now))
+        found.update(
+            self._check_smart(
+                snapshot.get("smart") or [], now,
+                skipped=snapshot.get("smart_skipped") or [],
+            )
+        )
         return found
 
     # -- 磁盘温度 / 状态 ---------------------------------------------------
@@ -374,7 +378,14 @@ class AlertEngine:
 
     # -- SMART -------------------------------------------------------------
 
-    def _check_smart(self, smart_list: list, now: float) -> dict[str, Alert]:
+    def _check_smart(self, smart_list: list, now: float,
+                     skipped: Iterable[str] = ()) -> dict[str, Alert]:
+        """SMART 异常。
+
+        `skipped` 是本轮**没取到 SMART**的盘（休眠中的盘不会去唤醒，单盘读取失败也算）。
+        这些盘既不能新增也不能恢复：数据取不到不等于故障消失，否则一块有坏道的盘
+        会在每次休眠/唤醒时收到一对「已恢复 / 又异常」的假通知。
+        """
         found: dict[str, Alert] = {}
         s = self._s
         for smart in smart_list:
@@ -433,6 +444,13 @@ class AlertEngine:
                     value=float(realloc + pending + offline),
                     since=now,
                 )
+
+        # 跳过的盘：沿用已经在告警中的条目，让状态机认为「本轮仍在」而不是「已恢复」
+        for name in {x for x in skipped if x}:
+            for key in (f"disk_smart:{name}", f"disk_smart_crc:{name}"):
+                existing = self._active.get(key)
+                if existing is not None:
+                    found.setdefault(key, existing)
         return found
 
     # ---------------------------------------------------------------- 容器
@@ -895,6 +913,12 @@ class AlertEngine:
     async def evaluate(self, snapshot: dict) -> list[AlertEvent]:
         async with self._lock:
             now = time.time()
+            degraded = set(snapshot.get("degraded") or [])
+            # 进程表为空时服务清单不可信（present 全 False，会把 11 个守护进程判成未运行）
+            service_health = snapshot.get("service_health") or {}
+            if (service_health.get("system_processes") or {}).get("reliable") is False:
+                degraded.add("service_health")
+
             storage = snapshot.get("storage") or {}
             disks = storage.get("disks") or []
             # 先采样休眠状态（幂等：同一状态重复 observe 不产生跳变）
@@ -902,11 +926,16 @@ class AlertEngine:
                 self._sleep.observe(disks, now)
 
             found = self._evaluate(snapshot)
-            found.update(self._evaluate_containers(snapshot.get("containers") or [], now))
+            # 数据源降级时**绝不**用空列表调用相对量规则：空列表会让它把基线全部清掉，
+            # 之后已停止的容器再也不会触发告警，active 告警也会被误判成恢复。
+            if "containers" not in degraded:
+                found.update(self._evaluate_containers(snapshot.get("containers") or [], now))
             system = snapshot.get("system") or {}
-            found.update(self._check_nics(system.get("nics") or [], now))
-            found.update(self._check_nic_errors(system.get("nics") or [], now))
-            found.update(self._evaluate_services(snapshot, now))
+            if "system" not in degraded:
+                found.update(self._check_nics(system.get("nics") or [], now))
+                found.update(self._check_nic_errors(system.get("nics") or [], now))
+            if "service_health" not in degraded:
+                found.update(self._evaluate_services(snapshot, now))
             found.update(self._check_disk_wakes(disks, now))
 
             # 第四批：登录失败与备份任务（数据源为空时自然不产生告警）
@@ -930,7 +959,7 @@ class AlertEngine:
             # 降级的那些数据源，本轮既不新增也不恢复
             skipped = tuple(
                 prefix
-                for src in (snapshot.get("degraded") or [])
+                for src in degraded
                 for prefix in DEGRADED_KEY_PREFIXES.get(src, ())
             )
             for key in [
@@ -966,15 +995,36 @@ class AlertEngine:
             "highest": active[0].level if active else None,
         }
 
-    def suppress(self, container_name: str, suppressed: bool = True) -> None:
-        """用户主动停止的容器不再告警。"""
+    def suppress(self, container_name: str, suppressed: bool = True) -> list[AlertEvent]:
+        """用户主动停止的容器不再告警。
+
+        返回本次被撤下的告警事件（resolved），由路由层推送——只 pop 不发事件的话，
+        App 永远收不到「已恢复」，会一直停在「应运行但已停止」。
+        """
         if suppressed:
             self._suppressed.add(container_name)
-            self._active.pop(f"container_down:{container_name}", None)
-            self._active.pop(f"container_restart_loop:{container_name}", None)
-            self._active.pop(f"container_expected_down:{container_name}", None)
         else:
             self._suppressed.discard(container_name)
+        events = self._resolve_container_alerts(container_name)
+        if events:
+            self._events.extend(events)
+            if len(self._events) > 500:
+                self._events = self._events[-500:]
+        return events
+
+    def _resolve_container_alerts(self, name: str) -> list[AlertEvent]:
+        """撤下该容器的停止类告警并生成 resolved 事件。"""
+        events: list[AlertEvent] = []
+        for key in (
+            f"container_down:{name}",
+            f"container_restart_loop:{name}",
+            f"container_expected_down:{name}",
+        ):
+            alert = self._active.pop(key, None)
+            if alert is not None:
+                events.append(AlertEvent("resolved", alert))
+                log.info("告警恢复（用户主动停止）：%s", alert.title)
+        return events
 
     # ---------------------------------------------------------------- 基线透视
 

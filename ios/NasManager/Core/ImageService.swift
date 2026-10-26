@@ -141,11 +141,10 @@ struct DockerImage: Decodable, Identifiable {
 
 /// Docker 镜像管理。
 ///
-/// 已确认（见 docs/api-verified.md 第二节 Docker 部分）：
+/// 已确认（见 docs/api-verified.md 第二节 Docker / 镜像部分）：
 /// - 四个端点全是 POST，token 走 query
-/// - 列表大概率需要分页参数（容器接口的 `PageNum` 踩坑，第 4 条）
-/// 未确认：列表接口到底用 ShowLocalImageV2 还是 ObtainAllImages、body 里字段怎么叫。
-/// 因此这里按「多路径 + 多字段名」依次尝试，全部失败才抛错。
+/// - 列表用 `ShowLocalImageV2`，分页参数 `PageNum` / `PageSize`
+/// - 拉取 body 是 `name` / `version`；删除 body 是 `id` / `status` / `imageName` / `imageVersion`
 final class ImageService {
     private let client: UgosClient
 
@@ -164,21 +163,18 @@ final class ImageService {
     func list() async throws -> [DockerImage] {
         var lastError: Error = UgosError.decoding("镜像列表返回为空")
 
-        let paths = [
-            "v1/docker/image/ShowLocalImageV2",
-            "v1/docker/image/ObtainAllImages"
-        ]
-        for path in paths {
-            for body in ImageService.pageBodies {
-                do {
-                    let data = try await client.post(path, json: body)
-                    if let items = ImageService.parse(data) {
-                        return items
-                    }
-                    lastError = UgosError.decoding("镜像列表结构无法识别（\(path)）")
-                } catch {
-                    lastError = error
+        // 只认 ShowLocalImageV2：ObtainAllImages 是 Docker Hub 商店搜索，
+        // 会返回上千个本机没下载的镜像（踩坑 21）
+        let path = "v1/docker/image/ShowLocalImageV2"
+        for body in ImageService.pageBodies {
+            do {
+                let data = try await client.post(path, json: body)
+                if let items = ImageService.parse(data) {
+                    return items
                 }
+                lastError = UgosError.decoding("镜像列表结构无法识别（\(path)）")
+            } catch {
+                lastError = error
             }
         }
         throw lastError
@@ -216,15 +212,16 @@ final class ImageService {
         guard let id = image.imageId, !id.isEmpty else {
             throw UgosError.auth("该镜像缺少 id，无法删除")
         }
-        // 镜像被容器占用时服务端会直接报错，不做强制删除（不可逆）
-        let bodies: [[String: Any]] = [
-            ["id": id],
-            ["imageId": id],
-            ["Id": id]
+        // 实测必须四个字段齐全；status 固定 1（踩坑 25：对不存在的镜像也回 successful）
+        let body: [String: Any] = [
+            "id": id,
+            "status": 1,
+            "imageName": image.repository,
+            "imageVersion": image.tag
         ]
         try await postFirst(
             paths: ["v1/docker/image/DeleteImage"],
-            bodies: bodies,
+            bodies: [body],
             fallbackMessage: "删除镜像失败"
         )
     }
@@ -236,15 +233,11 @@ final class ImageService {
         guard !spec.isEmpty else { throw UgosError.auth("请填写镜像名") }
 
         let split = ImageService.split(spec)
-        let bodies: [[String: Any]] = [
-            ["image": spec],
-            ["imageName": split.repository, "tag": split.tag],
-            ["name": split.repository, "tag": split.tag],
-            ["Image": spec]
-        ]
+        // 实测字段名是 name / version，写成 imageName / imageVersion 会报 2052（踩坑 21 段表格）
+        let body: [String: Any] = ["name": split.repository, "version": split.tag]
         try await postFirst(
             paths: ["v1/docker/image/DownloadImage"],
-            bodies: bodies,
+            bodies: [body],
             fallbackMessage: "拉取镜像失败"
         )
     }

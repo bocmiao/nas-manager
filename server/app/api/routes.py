@@ -68,6 +68,8 @@ async def health(request: Request):
                 "authenticated": state.nas.has_session,
                 "last_poll_ok": state.last_poll_ok,
                 "last_poll_at": state.last_poll_at,
+                # 本轮取不到的数据源，便于排障：全空但 reachable=false 说明整机/会话不可用
+                "degraded": state.degraded,
             },
             "push": {
                 "configured": state.push.stats()["configured"],
@@ -415,6 +417,8 @@ async def container_action(
     container_id: str,
     action: str,
     nas: NasService = Depends(get_nas),
+    alerts: AlertEngine = Depends(get_alerts),
+    push: PushService = Depends(get_push),
 ):
     if action not in ("start", "stop", "restart"):
         raise HTTPException(status.HTTP_400_BAD_REQUEST, detail=f"不支持的操作：{action}")
@@ -422,7 +426,21 @@ async def container_action(
         result = await nas.container_action(container_id, action)
     except ValueError as exc:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
-    return ok(result)
+
+    # 用户主动停止必须告知告警引擎，否则下一两轮巡检就会报「应运行但已停止（非用户主动停止）」
+    name = result.get("container_name")
+    events = alerts.suppress(name, action == "stop") if name else []
+    pushed = 0
+    for ev in events:
+        pushed += await push.send_alert(ev)
+    return ok(
+        {
+            **result,
+            "suppressed": (action == "stop") if name else None,
+            "alert_events": [e.to_dict() for e in events],
+            "pushed": pushed,
+        }
+    )
 
 
 @router.get("/containers/baseline", dependencies=[Depends(require_auth)])
@@ -477,11 +495,18 @@ async def docker_images(images: ImageManager = Depends(get_images)):
 @router.delete("/docker/images", dependencies=[Depends(require_auth)])
 async def docker_images_delete(
     ids: list[str] = Query(..., description="镜像 id / name:tag / 镜像名，可重复"),
+    force: bool = Query(False, description="镜像仍被容器引用时是否强制删除"),
     images: ImageManager = Depends(get_images),
 ):
-    """删除镜像：传 1 个走 DeleteImage，多个走 BatchDeleteImage。"""
+    """删除镜像：传 1 个走 DeleteImage，多个走 BatchDeleteImage。
+
+    删除后会重新列一次校验，返回 `verified` / `still_present`；
+    被容器引用的镜像默认拒绝删除（Docker 会拒绝，UGOS 却回 successful）。
+    """
     try:
-        return ok(await images.delete(ids))
+        return ok(await images.delete(ids, force=force))
+    except PermissionError as exc:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, detail=str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
 
@@ -750,9 +775,24 @@ async def suppress_container(
     name: str,
     enabled: bool = True,
     alerts: AlertEngine = Depends(get_alerts),
+    push: PushService = Depends(get_push),
 ):
-    alerts.suppress(name, enabled)
-    return ok({"container": name, "suppressed": enabled})
+    """手动标记 / 取消「用户主动停止」。
+
+    取消标记时若还有该容器的告警，会补发 resolved 事件，避免 App 一直停在告警态。
+    """
+    events = alerts.suppress(name, enabled)
+    pushed = 0
+    for ev in events:
+        pushed += await push.send_alert(ev)
+    return ok(
+        {
+            "container": name,
+            "suppressed": enabled,
+            "alert_events": [e.to_dict() for e in events],
+            "pushed": pushed,
+        }
+    )
 
 
 @router.post("/alerts/poll", dependencies=[Depends(require_auth)])

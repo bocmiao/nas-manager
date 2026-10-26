@@ -447,7 +447,9 @@ GET https://<ip>:9443<entry>/js/*.js     → 正则提取 "v\d+/模块/动作"
 24. **快照只支持 Btrfs**：ext4 卷上创建/回滚直接 `9999 ... is not btrfs filesystem`，列表 `32003 文件夹不存在`。
     同一台机器上"接口通了"和"功能可用"是两件事。
 25. **删除类接口的幂等陷阱**：`DeleteImage`、`BatchDeleteImage`、`DELETE v1/snapshot/snapshot`
-    对**不存在**的目标都返回 `success/successful`。判断真伪只能"删完再列一次"。
+    对**不存在**的目标都返回 `success/successful`；镜像被停止的容器引用时 Docker 拒绝删除，
+    UGOS 仍然回 `successful`。判断真伪只能"删完再列一次"——中间层两个模块都按这个做，
+    并返回 `verified` / `still_present`（`snapshot.delete` / `images.delete`）。
 26. **`BatchDeleteImage` 的 `imageIds` 必须是对象数组**，元素形如
     `{id,status,imageName,imageVersion}`；传 `["sha256:…"]` 会报
     `json: cannot unmarshal string into Go struct field BatchDeleteImageRequest.imageIds`。
@@ -484,6 +486,8 @@ GET https://<ip>:9443<entry>/js/*.js     → 正则提取 "v\d+/模块/动作"
     → 只能给 active / sleeping 两态；ATA 层的 standby 与 sleep 无法区分，别编第三个值。
 36. **读 SMART 会把休眠盘唤醒**。中间层巡检原本每轮读全部盘的 SMART，等于自己破坏用户的休眠策略。
     现在对 `is_standby=true` 的盘跳过 SMART，代价是休眠期间 SMART 数据停在旧值。
+    → 告警侧必须把「跳过」当成「本轮无数据」（既不新增也不恢复），否则每次休眠/唤醒
+    都会刷一对「已恢复 / 又异常」的假通知。`all_smart()` 因此返回 `(明细, 跳过的盘名)`。
     → 任何「轮询式」监控接 UGOS 都要注意这条：读盘就会让盘转起来。
 37. **`v1/taskmgr/services` 不是 systemd 服务列表**，只是 UGOS 应用清单（本机 28 项），
     没有 smbd / nfsd / sshd，也没有运行状态字段（只列在跑的）。

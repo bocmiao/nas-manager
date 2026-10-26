@@ -177,11 +177,11 @@ final class SnapshotService {
         _ = try await client.post("v1/snapshot/snapshot", json: body)
     }
 
-    /// 兼容旧调用：按显示名匹配文件夹，匹配不到就用第一个共享文件夹。
+    /// 兼容旧调用：按显示名匹配文件夹。匹配不到直接抛错，绝不退化成「第一个文件夹」。
     func create(volumeName: String, remark: String, folders: [SnapshotFolder]) async throws {
         let target = SnapshotService.matchFolder(name: volumeName, in: folders)
         guard let target else {
-            throw UgosError.auth("找不到可快照的文件夹")
+            throw UgosError.auth("找不到名为「\(volumeName)」的快照文件夹")
         }
         try await create(folder: target, comment: remark)
     }
@@ -208,15 +208,14 @@ final class SnapshotService {
 
     // MARK: - 解析
 
+    /// 只按文件夹名精确匹配（不区分大小写）。匹配不到返回 nil，由调用方报错。
     static func matchFolder(name: String, in folders: [SnapshotFolder]) -> SnapshotFolder? {
         let target = name.trimmingCharacters(in: .whitespacesAndNewlines)
-        if !target.isEmpty {
-            if let hit = folders.first(where: { $0.name == target }) { return hit }
-            if let hit = folders.first(where: {
-                $0.name.compare(target, options: .caseInsensitive) == .orderedSame
-            }) { return hit }
-        }
-        return folders.first(where: { $0.folderType == "share" }) ?? folders.first
+        guard !target.isEmpty else { return nil }
+        if let hit = folders.first(where: { $0.name == target }) { return hit }
+        return folders.first(where: {
+            $0.name.compare(target, options: .caseInsensitive) == .orderedSame
+        })
     }
 
     private static func parseFolders(_ any: Any, folderType: String) -> [SnapshotFolder] {

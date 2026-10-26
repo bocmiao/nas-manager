@@ -153,8 +153,14 @@ class ImageManager:
 
     # ---------------------------------------------------------------- 删除
 
-    async def delete(self, refs: list[str]) -> dict:
-        """删除镜像。refs 支持 imageId、imageRef（name:tag）、镜像名。"""
+    async def delete(self, refs: list[str], force: bool = False) -> dict:
+        """删除镜像。refs 支持 imageId、imageRef（name:tag）、镜像名。
+
+        `DeleteImage` 对不存在的镜像也返回 `successful`，被停止的容器引用的镜像
+        Docker 会拒绝删除但 UGOS 仍回 `successful`，所以**删除后必须重新列表校验**，
+        否则客户端会以为删掉了、刷新后又还在。
+        `in_use` 非空时默认拒绝，需显式 `force=true`。
+        """
         if not refs:
             raise ValueError("未指定要删除的镜像")
 
@@ -181,12 +187,26 @@ class ImageManager:
         if not targets:
             return {
                 "requested": refs,
+                "attempted": [],
                 "deleted": [],
                 "missing": missing,
                 "mode": None,
+                "in_use": [],
+                "verified": True,
+                "still_present": [],
                 "server_result": None,
                 "note": "没有可删除的镜像（不存在或仍在拉取中）",
             }
+
+        in_use = [{"ref": t["ref"], "containers": t["containers"]}
+                  for t in targets if t["in_use"]]
+        if in_use and not force:
+            detail = "；".join(
+                f"{x['ref']}（被 {', '.join(x['containers'])} 引用）" for x in in_use
+            )
+            raise PermissionError(
+                f"镜像正被容器引用，Docker 会拒绝删除：{detail}。确认要删请显式传 force=true"
+            )
 
         # 单个走 DeleteImage，多个走 BatchDeleteImage（两套 body 结构不同）
         if len(targets) == 1:
@@ -214,15 +234,37 @@ class ImageManager:
             result = await self._nas.client.post("v1/docker/image/BatchDeleteImage", body)
             mode = "batch"
 
-        in_use = [{"ref": t["ref"], "containers": t["containers"]} for t in targets if t["in_use"]]
+        # 删除后校验：按 id 重新列一次，仍在列表里的就是没删掉
+        verified: bool | None = None
+        still: list[dict] = []
+        verify_error: str | None = None
+        try:
+            after = await self._fetch_raw()
+        except UgosError as exc:
+            verify_error = f"{type(exc).__name__}: {exc}"
+            log.warning("删除后复核镜像列表失败：%s", exc)
+        else:
+            remaining = {x.get("imageId") or "" for x in after}
+            still = [
+                {"ref": t["ref"], "id": t["id"], "containers": t["containers"]}
+                for t in targets if t["id"] in remaining
+            ]
+            verified = not still
+
+        still_refs = {x["ref"] for x in still}
         return {
             "requested": refs,
-            "deleted": [t["ref"] for t in targets],
+            "attempted": [t["ref"] for t in targets],
+            "deleted": [t["ref"] for t in targets if t["ref"] not in still_refs],
             "missing": missing,
             "mode": mode,
             "in_use": in_use,
+            "verified": verified,
+            "still_present": still,
+            "verify_error": verify_error,
             "server_result": result,
-            "note": "UGOS 对不存在的镜像也返回 successful，本层已先做存在性校验",
+            "note": "UGOS 对不存在的镜像也返回 successful，本层以「删除后重新列表」为准；"
+                    "verified=false 或 still_present 非空表示镜像其实还在（多为容器仍引用）",
         }
 
     # ---------------------------------------------------------------- 拉取

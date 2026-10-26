@@ -12,6 +12,8 @@
 
 只在「状态跳变」时告警（good→bad 报故障，bad→good 报恢复），不会刷屏。
 
+注意：只有被监控目标（自签证书）跳过证书校验；发往 webhook 的请求走标准证书校验。
+
 用法
   # 最简：盯中间层
   python sentinel.py --url http://192.0.2.10:8787/health --webhook https://example.com/hook
@@ -84,10 +86,20 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 # ---------------------------------------------------------------- 探测
 
 def _ctx() -> ssl.SSLContext:
+    """**只用于**被监控目标（自签证书的 NAS / 中间层），不校验对端。
+
+    绝不能拿去发 webhook：webhook 通常指向公网网关，不校验证书等于允许
+    中间人截获内网 IP 与故障详情，甚至伪造「已恢复」。
+    """
     ctx = ssl.create_default_context()
     ctx.check_hostname = False
     ctx.verify_mode = ssl.CERT_NONE
     return ctx
+
+
+def _webhook_ctx() -> ssl.SSLContext:
+    """webhook 走完整证书校验 + 主机名校验。"""
+    return ssl.create_default_context()
 
 
 def check_health(url: str, token: str, timeout: float) -> tuple[bool, str, dict]:
@@ -180,7 +192,7 @@ def send_webhook(url: str, fmt: str, headers: list[str], payload: dict, timeout:
         if key.strip():
             req.add_header(key.strip(), val.strip())
     try:
-        with urllib.request.urlopen(req, timeout=timeout, context=_ctx()) as resp:
+        with urllib.request.urlopen(req, timeout=timeout, context=_webhook_ctx()) as resp:
             return 200 <= resp.status < 300
     except urllib.error.HTTPError as exc:
         print(f"[sentinel] webhook 返回 HTTP {exc.code}", file=sys.stderr)
