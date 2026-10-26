@@ -1107,6 +1107,16 @@ async def files_space(
         raise HTTPException(status.HTTP_400_BAD_REQUEST, detail=exc.msg) from exc
 
 
+@router.get("/files/recycle-config", dependencies=[Depends(require_auth)])
+async def files_recycle_config(files: FileService = Depends(get_files)):
+    """回收站开关状态。
+
+    删除是否可恢复由**条目自身的 `recycle_open`** 决定（见 `/files/list` 的响应），
+    这个接口给整体提示用：`recoverable=false` 时所有删除都是永久删除。
+    """
+    return ok(await files.recycle_conf())
+
+
 @router.post("/files/upload", dependencies=[Depends(require_auth)])
 async def files_upload(
     request: Request,

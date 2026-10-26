@@ -223,6 +223,24 @@ def test_normalize() -> None:
     # 缺字段不能炸
     shallow = normalize_entry({"name": "x"})
     check("缺字段条目可归一化", shallow["size"] == 0 and shallow["is_dir"] is False)
+    # 保守默认：字段缺失时视为「不可回收」，避免对用户乱承诺能找回
+    check("缺 recycle_open 时保守为 False", shallow["recycle_open"] is False)
+
+    # 回收站标记必须透传 —— 这是删除前判断「能不能找回」的唯一依据
+    recyclable = normalize_entry({
+        "name": "a.txt", "file_type": 0, "recycle_open": True,
+        "recycle_in_path": True, "remaining_del_time": 86400,
+    })
+    check("recycle_open=True 透传", recyclable["recycle_open"] is True)
+    check("recycle_in_path 透传", recyclable["recycle_in_path"] is True)
+    check("remaining_del_time 透传", recyclable["remaining_del_time"] == 86400)
+
+    # 真机实测：共享目录下的条目 recycle_open 就是 false，删了不进回收站
+    not_recyclable = normalize_entry({
+        "name": "b.txt", "file_type": 0, "recycle_open": False,
+        "recycle_in_path": False, "recycle_status": 0,
+    })
+    check("recycle_open=False 透传", not_recyclable["recycle_open"] is False)
 
     check("ROOT_CATEGORIES 覆盖 1..9",
           all(i in ROOT_CATEGORIES for i in range(1, 10)),
@@ -290,7 +308,9 @@ def test_writes() -> None:
         b = last_body(c)
         check("delPaths.paths 是字符串数组",
               b.get("paths") == ["/volume1/docker/a", "/volume1/docker/b"], str(b.get("paths")))
-        check("delPaths 默认 forever=False（进回收站）", b.get("forever") is False)
+        # 注意用词：forever=False 只是「不主动要求永久删除」，
+        # 实际进不进回收站由条目所在目录的 recycle_open 决定，不能承诺「能找回」
+        check("delPaths 默认 forever=False（不主动要求永久删除）", b.get("forever") is False)
 
         await s.delete(["/a"], forever=True)
         check("forever 可置 True", last_body(c).get("forever") is True)
@@ -309,6 +329,26 @@ def test_writes() -> None:
             except FileRejected:
                 check(f"delPaths 拒绝{why}", True)
             check(f"delPaths {why} 未发请求", len(c.calls) == before)
+
+        # 回收站开关：整体提示用，真机实测 dir_recycle=False
+        s2, c2 = svc({
+            "v1/filemgr/getRecycleConf": {"desktop_recycle": True, "dir_recycle": False},
+        })
+        conf = await s2.recycle_conf()
+        check("recycle_conf 透传 desktop_recycle", conf["desktop_recycle"] is True)
+        check("recycle_conf 透传 dir_recycle", conf["dir_recycle"] is False)
+        check("两项都真才算可恢复（这里桌面开、目录关 → 仍算可恢复）",
+              conf["recoverable"] is True)
+
+        s3, _ = svc({
+            "v1/filemgr/getRecycleConf": {"desktop_recycle": False, "dir_recycle": False},
+        })
+        conf3 = await s3.recycle_conf()
+        check("全关时 recoverable=False", conf3["recoverable"] is False)
+
+        # 返回体不带任务 id 时，delete 不该伪造一个
+        out = await s.delete(["/a"], forever=False)
+        check("delPaths 无任务 id 时 task=None", out["task"] is None, str(out))
 
         await s.free_space("/volume1/docker")
         check("getPathFreeSize 传 path",

@@ -116,6 +116,8 @@ X-CurPass-Token: <RSA 加密后的账号密码>
 | 1301 | 不允许访问（**文件管理里最常见**：`path` 不在当前账号可见范围内，例如直接传卷根 `/volume1`；`getDirFileListV2` 参数不完整时也报这个） |
 | 499 | **文件不存在**（`downloadFile` 找不到路径时；HTTP 语义的码混在业务码里） |
 | 1327 | **存在同名文件夹**（`createFolder` 目标路径已存在） |
+| 1302 | **路径不存在**（`getDirFileListV2` 不带 path / root_type 时） |
+| 1375 | **回收站目录不存在**（该根分类支持回收站但实际没建目录，见踩坑 80） |
 | 2052 | 镜像名含非法字符（`DownloadImage` 字段名不对时也报这个） |
 | 5001 | 硬盘不存在（SMART/测速的 `disk` 参数值不对）；也用于**存储池不存在**（`pool/describe` 等参数名不对时） |
 | 9404 | **模块内路由不存在**（storage 等模块的兜底码，见踩坑 19） |
@@ -982,4 +984,52 @@ v1/vm/info   v1/vm/snapshot/list      v1/kvm/vm/list
     WKWebView 默认不显示，而且 `completionHandler` 不调用会让页面**永久卡死**。
     同理 `createWebViewWith` 不实现，`target="_blank"` 链接点了也没反应。
     这三类（弹窗、新窗口、下载）是容器面板在 WebView 里"能看不能用"的三个主要原因。
+
+
+## 四之七、回收站与删除语义（77~80，2026-10-26 实测）
+
+77. **`forever=false` 不保证进回收站，删了可能就没了**。
+    决定权在**条目自身的 `recycle_open`** 字段上，不在请求参数上：
+
+    | 条目字段 | 实测值 | 含义 |
+    |---|---|---|
+    | `recycle_open` | `false` | 该目录不支持回收站，删除即永久 |
+    | `recycle_in_path` | `false` | 该路径下无回收站目录 |
+    | `recycle_status` | `0` | 非回收站条目 |
+    | `remaining_del_time` | `null` | 回收站剩余保留时间，非回收站条目为空 |
+
+    实测流程：在共享目录建 `probe.txt` → `delPaths {forever: false}` → 文件立刻从目录消失
+    → 回收站列表 0 条。同时 `getRecycleConf` 返回 `{"desktop_recycle": true, "dir_recycle": false}`。
+
+    UGOS 网页端同样按此判断（前端源码）：
+    ```js
+    const s = !e[0].recycleOpen;   // 没开回收站 → true
+    this.delPaths(e, r || s)       // 强制 forever=true
+    ```
+    **所以客户端不能对用户承诺「可以找回」，必须读 `recycle_open` 再决定文案。**
+
+78. **`delPaths` 的返回值不是任务 id**。成功时返回 `{"result": ""}`（空字符串），
+    不像上传/下载那样给 uuid 让客户端轮询进度。把它当异步任务去 `getDelTaskInfo` 会一直查不到东西。
+
+79. **回收站列表复用 `getDirFileListV2`，不是独立接口**。请求体里加 `is_access_recycle: true`，
+    并按条目的 `is_access_recycle` 语义走同一套分页。回收站内搜索另有
+    `createRecycleSearchTask` / `getRecycleSearchTaskResult` / `cancelRecycleSearchTask`。
+
+80. **回收站目录不存在时回 `1375`（新错误码）**。`root_type=2` 调回收站列表得到
+    `1375 回收站目录不存在`，而 `root_type=3` 正常返回（空列表）。
+    `getRecycleRootDirs` 返回的 `root_list` 只是「支持回收站的根分类」，
+    不代表每个根下真的建了回收站目录。
+
+### 回收站相关接口清单（备查，本轮未接入）
+
+| 方法 | 路径 | 用途 |
+|---|---|---|
+| GET | `v1/filemgr/getRecycleConf` | `{desktop_recycle, dir_recycle}` 开关状态 |
+| GET | `v1/filemgr/getRecycleRootDirs` | `{root_list: [2,3,4]}` 支持回收站的根分类 |
+| POST | `v1/filemgr/restoreRecycle` | **恢复文件**，body 为路径数组 |
+| POST | `v1/filemgr/emptyRecycleBin` | 清空回收站 |
+| POST | `v1/filemgr/switchRecycle` | 开/关回收站 |
+| POST | `v1/filemgr/setRecycleConf` | 改回收站配置 |
+| POST | `v1/filemgr/addPlan` / `editScheduledTask` / `rmPlan` | 定时清理计划 |
+| POST | `v1/filemgr/createRecycleSearchTask` / `getRecycleSearchTaskResult` / `cancelRecycleSearchTask` / `removeRecycleSearchTask` | 回收站内搜索 |
 

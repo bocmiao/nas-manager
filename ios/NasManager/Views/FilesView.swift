@@ -148,11 +148,15 @@ struct FilesView: View {
         } message: {
             Text("原名：\(pendingRename?.name ?? "")")
         }
-        .confirmationDialog("删除「\(pendingDelete?.name ?? "")」？", isPresented: deleteBinding, titleVisibility: .visible) {
-            Button("移入回收站") {
-                let target = pendingDelete
-                pendingDelete = nil
-                if let target { Task { await performDelete(target, forever: false) } }
+        .confirmationDialog(deleteTitle, isPresented: deleteBinding, titleVisibility: .visible) {
+            // 只有该目录确实支持回收站时才给「移入回收站」这个选项。
+            // 否则用户会以为能找回，实际 NAS 直接永久删除（实测 recycle_open=false 就是这样）。
+            if canRecoverDelete {
+                Button("移入回收站") {
+                    let target = pendingDelete
+                    pendingDelete = nil
+                    if let target { Task { await performDelete(target, forever: false) } }
+                }
             }
             Button("永久删除（不可恢复）", role: .destructive) {
                 let target = pendingDelete
@@ -161,7 +165,7 @@ struct FilesView: View {
             }
             Button("取消", role: .cancel) { pendingDelete = nil }
         } message: {
-            Text("默认移入 NAS 的回收站，可以在回收站里找回；选择「永久删除」则无法恢复。")
+            Text(deleteMessage)
         }
         .alert("操作失败", isPresented: actionErrorBinding) {
             Button("好", role: .cancel) { actionError = nil }
@@ -567,6 +571,23 @@ struct FilesView: View {
                 if !visible { pendingDelete = nil }
             }
         )
+    }
+
+    /// 删除后能不能从回收站找回，取决于条目所在目录的 `recycle_open`
+    private var canRecoverDelete: Bool {
+        pendingDelete?.isDeletionRecoverable ?? false
+    }
+
+    private var deleteTitle: String {
+        let name = pendingDelete?.name ?? ""
+        return canRecoverDelete ? "删除「\(name)」？" : "永久删除「\(name)」？"
+    }
+
+    private var deleteMessage: String {
+        if canRecoverDelete {
+            return "移入回收站后可以从 NAS 回收站找回；选「永久删除」则无法恢复。"
+        }
+        return "该目录没有开启回收站，删除后无法找回，文件会被立即清除。"
     }
 
     private var actionErrorBinding: Binding<Bool> {

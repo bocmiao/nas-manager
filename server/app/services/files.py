@@ -146,6 +146,14 @@ def normalize_entry(raw: dict, root_type: int | None = None) -> dict:
         "intranet_share_id": int(raw.get("intranet_share_id") or 0),
         "is_mount": bool((raw.get("mount") or {}).get("is_mount")),
         "recycle_status": raw.get("recycle_status"),
+        # 该条目所在目录**是否支持回收站**。这是删除前必须看的字段：
+        # 实测这台 NAS 上共享目录的 recycle_open 是 false，此时删文件是**直接永久删除**，
+        # 根本不会进回收站（UGOS 网页端也是这么处理的：recycle_open=false 就强制 forever=true）。
+        # 不透传这个字段，客户端就只能瞎承诺「可以找回」。
+        "recycle_open": bool(raw.get("recycle_open")),
+        "recycle_in_path": bool(raw.get("recycle_in_path")),
+        # 回收站里剩余保留时间（秒/天由 NAS 侧决定），非回收站条目为 0
+        "remaining_del_time": raw.get("remaining_del_time"),
         "is_tag": is_tag,
         "tag_id": raw.get("tag_id"),
         "tag_colour": raw.get("colour"),
@@ -307,8 +315,30 @@ class FileService:
         data = await self._c.post("v2/filemgr/rename", {"path": clean, "new_name": new_name})
         return normalize_entry(data or {})
 
+    async def recycle_conf(self) -> dict:
+        """回收站开关状态（`GET v1/filemgr/getRecycleConf`）。
+
+        实测本机返回 `{"desktop_recycle": true, "dir_recycle": false}`：
+        目录级回收站是关的，此时删除**不会进回收站**，删完就没了。
+        单条目的准确信息看条目自身的 `recycle_open`，这里只作整体提示用。
+        """
+        raw = await self._c.get("v1/filemgr/getRecycleConf") or {}
+        desktop = bool(raw.get("desktop_recycle"))
+        directory = bool(raw.get("dir_recycle"))
+        return {
+            "desktop_recycle": desktop,
+            "dir_recycle": directory,
+            # 两个都关时，删除一定不可恢复
+            "recoverable": desktop or directory,
+        }
+
     async def delete(self, paths: list[str], forever: bool = False) -> dict:
-        """删除。`paths` 必须是字符串数组，传对象数组 NAS 会报 9999。"""
+        """删除。`paths` 必须是字符串数组，传对象数组 NAS 会报 9999。
+
+        注意：`forever=false` **不保证**进回收站——是否回收由条目所在目录的
+        `recycle_open` 决定，该字段为 false 时删了就是永久删除。
+        所以调用方要用条目上的 `recycle_open` 做提示，别对用户乱承诺。
+        """
         if not paths:
             raise FileRejected("paths 不能为空")
         if not isinstance(paths, list):
@@ -316,8 +346,16 @@ class FileService:
         cleaned = [sanitize_path(p) for p in paths if isinstance(p, str)]
         if len(cleaned) != len(paths):
             raise FileRejected("paths 里有非字符串项")
-        await self._c.post("v2/filemgr/delPaths", {"paths": cleaned, "forever": bool(forever)})
-        return {"deleted": cleaned, "forever": bool(forever)}
+        data = await self._c.post(
+            "v2/filemgr/delPaths", {"paths": cleaned, "forever": bool(forever)}
+        )
+        # 返回的 result 通常是空串而不是任务 id，别当成异步任务去轮询
+        task = data.get("result") if isinstance(data, dict) else None
+        return {
+            "deleted": cleaned,
+            "forever": bool(forever),
+            "task": task if isinstance(task, str) and task else None,
+        }
 
     # ------------------------------------------------------------- 上传
 

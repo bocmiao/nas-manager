@@ -148,6 +148,11 @@ struct FileEntry: Decodable, Identifiable, Hashable {
     let intranetShareID: Int?
     let isMount: Bool
     let recycleStatus: Int?
+    /// 该条目所在目录**是否支持回收站**。false 时删除是永久删除，删了找不回。
+    /// UGOS 网页端同样按此判断：recycle_open=false 就强制 forever=true。
+    let recycleOpen: Bool
+    /// 回收站条目剩余保留时间；非回收站条目为空
+    let remainingDelTime: Int?
     /// 标签根下的条目本身就是标签定义，未必带 `tag_id`，由服务层按 `root_type` 补标
     var isTag: Bool
     let tagID: Int?
@@ -158,6 +163,9 @@ struct FileEntry: Decodable, Identifiable, Hashable {
     /// 标签与目录都不能下载；删除只对真实文件/目录开放
     var isDownloadable: Bool { !isDir && !isTag }
     var isDeletable: Bool { !isTag }
+
+    /// 删除这个条目后能不能从回收站找回
+    var isDeletionRecoverable: Bool { recycleOpen }
     var isRenamable: Bool { !isTag }
 
     var sizeText: String { isDir ? "--" : Format.bytes(size) }
@@ -196,6 +204,8 @@ struct FileEntry: Decodable, Identifiable, Hashable {
         case intranetShareID = "intranet_share_id"
         case isMount = "is_mount"
         case recycleStatus = "recycle_status"
+        case recycleOpen = "recycle_open"
+        case remainingDelTime = "remaining_del_time"
         case isTag = "is_tag"
         case tagID = "tag_id"
         case tagColour = "tag_colour"
@@ -246,6 +256,9 @@ struct FileEntry: Decodable, Identifiable, Hashable {
         icon = Lenient.int(c, .icon)
         intranetShareID = Lenient.int(c, .intranetShareID)
         recycleStatus = Lenient.int(c, .recycleStatus)
+        // 缺字段时默认 false（保守：宁可提示「不可恢复」，也不要骗用户说能找回）
+        recycleOpen = Lenient.bool(c, .recycleOpen) ?? false
+        remainingDelTime = Lenient.int(c, .remainingDelTime)
         isDir = dirValue
         tagID = tagIdValue
         isTag = tagValue
