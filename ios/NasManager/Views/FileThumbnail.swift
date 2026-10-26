@@ -65,13 +65,17 @@ final class ThumbnailLoader {
             active += 1
             return
         }
+        // 挂起等名额。名额由 release() 直接转交，醒来后不要再自增，
+        // 否则 release 减一 + 这里加一之间会被新来的插队，实际并发会超限。
         await withCheckedContinuation { waiters.append($0) }
-        active += 1
     }
 
     private func release() {
-        active = max(0, active - 1)
-        guard !waiters.isEmpty else { return }
+        if waiters.isEmpty {
+            active = max(0, active - 1)
+            return
+        }
+        // 名额就地转交，active 不变
         waiters.removeFirst().resume()
     }
 }

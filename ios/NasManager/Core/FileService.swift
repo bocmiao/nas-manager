@@ -1130,43 +1130,68 @@ final class FileService {
         )
     }
 
-    /// 等任务落地：轮询目标目录，直到条目出现（复制）或从源目录消失（移动）。
+    /// 等任务落地：轮询目录判断完成。
     ///
-    /// NAS 没有任务进度接口，只能靠结果推断。小文件实测 0.7 秒完成，
-    /// 这里给到 30 秒，超时就当失败——起码不会让界面一直转圈。
+    /// 两个容易写错的地方，这里都按实测纠过：
+    /// 1. **复制要盯目标目录本身**，不是它的父目录。盯父目录会立刻看到源文件就在那儿，
+    ///    直接假成功。
+    /// 2. `action_type=3` 会**改名**（`hello.txt` → `hello(1).txt`），
+    ///    所以不能只比 `==`，得认「同名」和「原名(n)」两种。
     func waitForTransfer(
         _ result: FileTransferResult,
         attempts: Int = 30,
         interval: TimeInterval = 1.0
     ) async throws {
-        let probe = result.isMove
-            ? (result.source.first ?? "")
-            : result.destination
-        guard !probe.isEmpty else { return }
-        let parent = probe.contains("/")
-            ? String(probe[..<(probe.lastIndex(of: "/") ?? probe.startIndex)])
-            : probe
+        // 移动看源目录有没有清空，复制看目标目录有没有到货
+        let watchDir: String
+        if result.isMove {
+            guard let first = result.source.first, !first.isEmpty else { return }
+            watchDir = FileService.parentPath(of: first)
+        } else {
+            guard !result.destination.isEmpty else { return }
+            watchDir = result.destination
+        }
+        let sourceNames = result.source.map { ($0 as NSString).lastPathComponent }
+        guard !sourceNames.isEmpty else { return }
 
         for _ in 0..<max(1, attempts) {
-            let listing = try? await list(
-                path: parent, page: 1, sort: .name, reverse: false
-            )
-            let names = Set((listing?.entries ?? []).map(\.name))
-            if result.isMove {
-                // 移动：源目录里都不在了就算完
-                let still = result.source.compactMap { $0.split(separator: "/").last }
-                    .map(String.init)
-                    .filter { names.contains($0) }
-                if still.isEmpty { return }
-            } else {
-                let arrived = result.source.compactMap { $0.split(separator: "/").last }
-                    .map(String.init)
-                    .filter { names.contains($0) }
-                if !arrived.isEmpty { return }
+            if let listing = try? await list(
+                path: watchDir, page: 1, sort: .name, reverse: false
+            ) {
+                let names = listing.entries.map(\.name)
+                if result.isMove {
+                    // 移动：源文件都不在源目录了就算完
+                    let remaining = sourceNames.filter(names.contains)
+                    if remaining.isEmpty { return }
+                } else {
+                    // 复制：目标目录里出现同名或「原名(n)」就算完
+                    let arrived = sourceNames.contains { source in
+                        names.contains { FileService.isArrival($0, of: source) }
+                    }
+                    if arrived { return }
+                }
             }
             try? await Task.sleep(nanoseconds: UInt64(interval * 1_000_000_000))
         }
-        throw UgosError.auth(result.isMove ? "移动还没完成，等下刷新看看" : "复制还没完成，等下刷新看看")
+        throw UgosError.auth(
+            result.isMove ? "移动还没完成，等下刷新看看" : "复制还没完成，等下刷新看看"
+        )
+    }
+
+    /// 目标目录里的 `candidate` 是不是源文件 `source` 落地后的名字。
+    ///
+    /// 认两种：原名，以及 NAS 在 `action_type=3` 下生成的 `原名(n).后缀`。
+    /// 只认「括号里全是数字」的形式，避免把 `helloWorld.txt` 当成 `hello.txt`。
+    static func isArrival(_ candidate: String, of source: String) -> Bool {
+        if candidate == source { return true }
+        let ns = source as NSString
+        let base = ns.deletingPathExtension
+        let ext = ns.pathExtension
+        let prefix = base + "("
+        let suffix = ext.isEmpty ? ")" : ")." + ext
+        guard candidate.hasPrefix(prefix), candidate.hasSuffix(suffix) else { return false }
+        let middle = candidate.dropFirst(prefix.count).dropLast(suffix.count)
+        return !middle.isEmpty && middle.allSatisfy { $0.isNumber }
     }
 
     // MARK: 上传

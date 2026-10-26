@@ -692,6 +692,51 @@ def test_archive() -> None:
     check("非法入参全部本地拒绝", not leaked, str(leaked))
 
 
+# ---------------------------------------------------------------- 12. 文件夹体积
+
+def test_folder_size() -> None:
+    print("\n[12] 文件夹体积")
+
+    async def run():
+        s, c = svc({"v2/filemgr/getSizeAndCount": {
+            "size": 749719225, "takes_space": 754683904,
+            "file_count": 2099, "dir_count": 310,
+            "hide_count": 0, "status": 0, "calculate_id": "abc123",
+        }})
+        return await s.folder_size("/volume1/docker"), c
+
+    r, c = asyncio.run(run())
+    check("size 解析正确", r.get("size") == 749719225, str(r.get("size")))
+    check("takes_space 解析正确", r.get("takes_space") == 754683904, str(r.get("takes_space")))
+    check("文件/目录数解析正确",
+          (r.get("file_count"), r.get("dir_count")) == (2099, 310), str(r))
+    check("calculate_id 带出来", r.get("calculate_id") == "abc123", str(r.get("calculate_id")))
+
+    params = c.calls[-1][2] or {}
+    # 这是最容易踩的坑：少了 intranet_share_id，NAS 返回的数字全是 0，
+    # 看着像空目录其实是没算
+    check("必须带 intranet_share_id（否则数字全 0）",
+          params.get("intranet_share_id") == 0, str(params))
+    check("path 已传入", params.get("path") == "/volume1/docker", str(params.get("path")))
+
+    async def bad():
+        s, _ = svc({})
+        try:
+            await s.folder_size("volume1/docker")
+            return "no-raise"
+        except FileRejected:
+            return "rejected"
+
+    check("相对路径被本地拒绝", asyncio.run(bad()) == "rejected")
+
+    async def zero():
+        s, _ = svc({"v2/filemgr/getSizeAndCount": {}})
+        return await s.folder_size("/volume1/docker")
+
+    r = asyncio.run(zero())
+    check("字段缺失时全部归零不炸", r.get("size") == 0 and r.get("file_count") == 0, str(r))
+
+
 def main() -> int:
     test_sanitize()
     test_list_body()
@@ -704,6 +749,7 @@ def main() -> int:
     test_roots()
     test_transfer()
     test_archive()
+    test_folder_size()
 
     failed = [r for r in results if r[0] == FAIL]
     print("\n" + "=" * 50)

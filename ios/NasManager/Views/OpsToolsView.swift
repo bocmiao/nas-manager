@@ -68,17 +68,7 @@ struct OpsToolsView: View {
             }
 
             Section {
-                NavigationLink {
-                    FilesView(model: model)
-                } label: {
-                    OpsRow(
-                        icon: "folder",
-                        tint: .indigo,
-                        title: "文件管理",
-                        detail: "浏览共享与个人目录，下载 / 重命名 / 删除文件"
-                    )
-                }
-
+                // 文件管理已提到一级 Tab，这里不再重复放入口
                 NavigationLink {
                     ImagesView(model: model)
                 } label: {
