@@ -1033,3 +1033,66 @@ v1/vm/info   v1/vm/snapshot/list      v1/kvm/vm/list
 | POST | `v1/filemgr/addPlan` / `editScheduledTask` / `rmPlan` | 定时清理计划 |
 | POST | `v1/filemgr/createRecycleSearchTask` / `getRecycleSearchTaskResult` / `cancelRecycleSearchTask` / `removeRecycleSearchTask` | 回收站内搜索 |
 
+
+## 四之八、缩略图与媒体预览（81~84，2026-10-26 实测）
+
+81. **缩略图接口完全忽略 `width` / `height`**。
+    `GET v1/filemgr/thumbnail?path=&type=&size_type=0&mtime=&ctime=&file_size=&width=&height=`
+    看似能指定尺寸，实测**无论传多少都回同一张图**：
+
+    | 请求 width | HTTP | 返回 |
+    |---|---|---|
+    | 16 | 200 | JPEG **112×96**，1017 字节 |
+    | 48 | 200 | 同上 |
+    | 88 | 200 | 同上 |
+    | 120 | 200 | 同上 |
+    | 256 | 200 | 同上 |
+    | 512 | 200 | 同上 |
+    | 1024 / 2048 | 200 | 同上 |
+
+    源图是自造的 1600×1200 PNG。UGOS 前端自己传的也是固定预设
+    `[16, 120, 88, 48]`（选中态/普通态之类的档位），说明服务端只认预设档，
+    非法值落回同一个默认缩略图。
+    **结论：这接口只配做列表小图标，别指望它出大图。**
+
+82. **首次请求回 `HTTP 423`（Locked），body 是 `thumbnail is generating asynchronizely`**。
+    不是错误码体系里的东西，是 HTTP 状态直接 423。实测要 2~3 秒，
+    重试 2 次左右才 200。生成后 NAS 侧有缓存，同一文件再取直接 200。
+    重试不要少于 6 次 × 0.8 秒。
+
+83. **返回体统一是 JPEG**，哪怕源文件是 PNG（实测 1600×1200 PNG 拿回来是 JPEG）。
+    所以不能靠原文件后缀判断 content-type。
+
+84. **大图预览走 `GET v1/filemgr/mediaPlayer`，不用换 `dl_token`**。
+    参数形状和 thumbnail 几乎一样，多一个可选的 `code=1`（实测带不带都行）：
+
+    ```
+    GET v1/filemgr/mediaPlayer?path=&type=1&size_type=0&mtime=&ctime=&file_size=
+        &intranet_share_id=0&width=1920&height=1080&token=<会话 token>
+    ```
+
+    实测：1600×1200 PNG 源文件 37334 字节，拿回来**正好 37334 字节，一字节不差**，
+    `content-type` 也照实回 `image/png`。
+
+    对比三条取字节的路子：
+
+    | 通道 | 换 token | 返回 | 适合 |
+    |---|---|---|---|
+    | `thumbnail` | 不需要 | 112×96 JPEG | 列表小图标 |
+    | `mediaPlayer` | **不需要** | 源文件本体 | 大图预览 |
+    | `downloadFile` | 需要三步换 `dl_token` | 源文件本体 | 落盘存档 |
+
+    `mediaPlayer` 是预览的最短路径。但**没有验证 Range 支持**，
+    视频拖动播放能不能用它还是未知数，播视频目前仍建议走下载链路。
+
+### 由上述结论落地的代码
+
+| 位置 | 做了什么 |
+|---|---|
+| `ios/NasManager/Core/UgosClient.swift` | 新增 `getBinary`：不走 JSON 解析，423 退避重试，会话过期自动重登 |
+| `ios/NasManager/Core/FileService.swift` | `thumbnail(for:)` 列表缩略图、`previewBytes(for:)` 原图通道 |
+| `ios/NasManager/Views/FileThumbnail.swift` | 内存缓存（`path\|mtime\|size` 做键）+ 3 路并发闸门，失败静默退回系统图标 |
+| `ios/NasManager/Views/ImagePreviewView.swift` | 全屏预览，双指缩放 / 双击切换 / 仅放大后可拖动，>64MB 直接劝退 |
+| `server/app/services/files.py` | `thumbnail()` 修正尺寸语义、`preview()` 新增 `mediaPlayer` 通道 |
+| `server/app/api/routes.py` | `GET /files/thumbnail`、`GET /files/preview` |
+| `scripts/test_media.py` | 22 项离线断言（请求形状 / 423 重试 / 路径安全） |

@@ -31,6 +31,7 @@
 """
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import logging
@@ -314,6 +315,106 @@ class FileService:
         clean = sanitize_path(path)
         data = await self._c.post("v2/filemgr/rename", {"path": clean, "new_name": new_name})
         return normalize_entry(data or {})
+
+    async def thumbnail(
+        self,
+        path: str,
+        width: int = 88,
+        height: int = 88,
+        file_type: int = 1,
+        mtime: int = 0,
+        ctime: int = 0,
+        file_size: int = 0,
+        retries: int = 6,
+        delay: float = 0.8,
+    ) -> tuple[bytes, str]:
+        """取文件缩略图，返回 `(二进制, content-type)`。
+
+        实测四个要点：
+        1. 鉴权走 **query token**（不带 token 直接 `1010 Token不可为空`）
+        2. 首次请求返回 **HTTP 423** + `thumbnail is generating asynchronizely`，
+           需要重试；实测约 2~3 秒后转 200
+        3. 返回的**统一是 JPEG**（即使原图是 PNG），所以别拿原图后缀去判断
+        4. **`width` / `height` 会被完全忽略**。前端传的是固定预设
+           `[16, 120, 88, 48]`，但实测传 16 和传 512 拿回来的是同一张
+           **112×96 JPEG（约 1KB）**。所以这个接口只配做列表小图标，
+           需要原图请走 `preview()`。
+
+        生成后 NAS 侧会缓存，同一文件再请求直接 200。
+        """
+        clean = sanitize_path(path)
+        # 传了也没用，但还是按前端的预设值传，避免非预期分支
+        width = max(16, min(int(width), 1024))
+        height = max(16, min(int(height), 1024))
+        token = await self._c.session_token()
+        params = {
+            "path": clean,
+            "type": int(file_type or 1),
+            "size_type": 0,
+            "mtime": int(mtime or 0),
+            "ctime": int(ctime or 0),
+            "file_size": int(file_size or 0),
+            "intranet_share_id": 0,
+            "width": width,
+            "height": height,
+            "token": token,
+        }
+
+        last_note = ""
+        for _ in range(max(1, retries)):
+            async with self._c.open_stream("v1/filemgr/thumbnail", params) as resp:
+                if resp.status_code == 200:
+                    data = await resp.aread()
+                    if not data:
+                        raise FileRejected("缩略图返回空内容")
+                    ctype = resp.headers.get("content-type") or "image/jpeg"
+                    return data, ctype
+                last_note = (await resp.aread()).decode("utf-8", "replace")[:160]
+                if resp.status_code != 423:
+                    raise FileRejected(f"缩略图返回 HTTP {resp.status_code}：{last_note}")
+            # 只有 423（正在生成）会走到这里
+            await asyncio.sleep(delay)
+        raise FileRejected(f"缩略图仍在生成中，稍后再试（{last_note}）")
+
+    async def preview(
+        self,
+        path: str,
+        file_type: int = 1,
+        mtime: int = 0,
+        ctime: int = 0,
+        file_size: int = 0,
+    ) -> tuple[bytes, str]:
+        """原图字节通道（`GET v1/filemgr/mediaPlayer`），返回 `(二进制, content-type)`。
+
+        跟 `download()` 拿到的内容一样，但**不用三步换 `dl_token`**，
+        带会话 token 一次就取到。实测 1600×1200 PNG 源图 37334 字节，
+        回来一字节不差，`content-type` 也照实回 `image/png`。
+
+        用途是预览；真要落盘存档还是走 `download()`，那条才是官方下载语义。
+        """
+        clean = sanitize_path(path)
+        token = await self._c.session_token()
+        params = {
+            "path": clean,
+            "type": int(file_type or 1),
+            "size_type": 0,
+            "mtime": int(mtime or 0),
+            "ctime": int(ctime or 0),
+            "file_size": int(file_size or 0),
+            "intranet_share_id": 0,
+            "width": 1920,
+            "height": 1080,
+            "token": token,
+        }
+        async with self._c.open_stream("v1/filemgr/mediaPlayer", params) as resp:
+            if resp.status_code != 200:
+                note = (await resp.aread()).decode("utf-8", "replace")[:160]
+                raise FileRejected(f"预览返回 HTTP {resp.status_code}：{note}")
+            ctype = resp.headers.get("content-type") or "application/octet-stream"
+            data = await resp.aread()
+        if not data:
+            raise FileRejected("预览返回空内容")
+        return data, ctype
 
     async def recycle_conf(self) -> dict:
         """回收站开关状态（`GET v1/filemgr/getRecycleConf`）。

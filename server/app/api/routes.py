@@ -7,7 +7,7 @@ import time
 from urllib.parse import quote
 
 from fastapi import APIRouter, Body, Depends, HTTPException, Query, Request, status
-from fastapi.responses import StreamingResponse
+from fastapi.responses import Response, StreamingResponse
 
 from ..services.alerts import AlertEngine
 from ..services.backup import BackupService
@@ -1105,6 +1105,64 @@ async def files_space(
         return ok(await files.free_space(path))
     except FileRejected as exc:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, detail=exc.msg) from exc
+
+
+@router.get("/files/thumbnail", dependencies=[Depends(require_auth)])
+async def files_thumbnail(
+    path: str = Query(..., description="图片文件路径"),
+    width: int = Query(88, ge=16, le=1024),
+    height: int = Query(88, ge=16, le=1024),
+    file_type: int = Query(1, description="条目 type，图片实测是 1"),
+    mtime: int = Query(0, description="条目 mtime，作为 NAS 侧缓存键"),
+    ctime: int = Query(0),
+    file_size: int = Query(0),
+    files: FileService = Depends(get_files),
+):
+    """文件缩略图，直接返回图片二进制。
+
+    注意：`width` / `height` 会被 NAS 忽略，实测无论传多大都回同一张
+    112×96 JPEG。要原图请用 `/files/preview`。
+    """
+    try:
+        data, content_type = await files.thumbnail(
+            path, width=width, height=height, file_type=file_type,
+            mtime=mtime, ctime=ctime, file_size=file_size,
+        )
+    except FileRejected as exc:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, detail=exc.msg) from exc
+    return Response(
+        content=data,
+        media_type=content_type,
+        headers={"Cache-Control": "private, max-age=3600"},
+    )
+
+
+@router.get("/files/preview", dependencies=[Depends(require_auth)])
+async def files_preview(
+    path: str = Query(..., description="文件路径"),
+    file_type: int = Query(1, description="条目 type，图片通常是 1"),
+    mtime: int = Query(0),
+    ctime: int = Query(0),
+    file_size: int = Query(0),
+    files: FileService = Depends(get_files),
+):
+    """原图字节，用于大图预览。
+
+    走 `mediaPlayer` 通道，返回的就是源文件本体（不是缩略图）。
+    注意没有做 Range 支持，视频拖动播放请改用下载链路。
+    """
+    try:
+        data, content_type = await files.preview(
+            path, file_type=file_type,
+            mtime=mtime, ctime=ctime, file_size=file_size,
+        )
+    except FileRejected as exc:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, detail=exc.msg) from exc
+    return Response(
+        content=data,
+        media_type=content_type,
+        headers={"Cache-Control": "private, max-age=600"},
+    )
 
 
 @router.get("/files/recycle-config", dependencies=[Depends(require_auth)])

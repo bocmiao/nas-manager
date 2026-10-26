@@ -58,6 +58,7 @@ struct FilesView: View {
     @State private var busyPath: String?
     @State private var actionError: String?
     @State private var shared: SharedFile?
+    @State private var previewEntry: FileEntry?
 
     @State private var showingImporter = false
     @State private var uploadProgress: FileUploadProgress?
@@ -179,6 +180,9 @@ struct FilesView: View {
         }
         .sheet(item: $shared) { file in
             shareSheet(file)
+        }
+        .sheet(item: $previewEntry) { entry in
+            ImagePreviewView(model: model, entry: entry)
         }
     }
 
@@ -431,10 +435,7 @@ struct FilesView: View {
             open(entry)
         } label: {
             HStack(spacing: 10) {
-                Image(systemName: entry.iconName)
-                    .font(.body)
-                    .foregroundStyle(entry.isDir ? Color.accentColor : Color.secondary)
-                    .frame(width: 24, alignment: .center)
+                FileThumbnailView(model: model, entry: entry, side: 24)
 
                 VStack(alignment: .leading, spacing: 2) {
                     Text(entry.name)
@@ -678,6 +679,9 @@ struct FilesView: View {
             push(FileNode(name: entry.name, path: entry.path, rootType: nil))
         } else if entry.isTag {
             actionError = "标签不是文件，不能下载"
+        } else if FileService.supportsThumbnail(entry) {
+            // 图片直接看，不用先下载到本地再分享
+            previewEntry = entry
         } else {
             Task { await performDownload(entry) }
         }

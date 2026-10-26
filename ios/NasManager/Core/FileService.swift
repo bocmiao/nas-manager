@@ -760,6 +760,62 @@ final class FileService {
         }
     }
 
+    // MARK: 缩略图
+
+    /// 只有真实图片才有缩略图；目录、标签、其它类型都退回系统图标
+    static func supportsThumbnail(_ entry: FileEntry) -> Bool {
+        !entry.isDir && !entry.isTag && entry.extGroup == "image"
+    }
+
+    /// 取图片缩略图。
+    ///
+    /// 实测结论（重要）：**`width` / `height` 会被 NAS 完全忽略**。
+    /// 前端传的也是固定预设 `[16, 120, 88, 48]`，但无论传 16 还是 512，
+    /// 1600×1200 的源图拿回来都是同一个 **112×96 JPEG（约 1KB）**。
+    /// 所以这个接口只适合列表小图标，**别指望它出大图**——大图走 `previewBytes`。
+    ///
+    /// 首次请求会回 **423**（异步转码中），退避重试交给 `UgosClient.getBinary`。
+    /// 返回体统一是 JPEG，哪怕源文件是 PNG。
+    func thumbnail(for entry: FileEntry) async throws -> Data {
+        guard Self.supportsThumbnail(entry) else {
+            throw UgosError.auth("这个条目没有缩略图")
+        }
+        let params: [String: String] = [
+            "path": entry.path,
+            "type": String(entry.fileType ?? 1),
+            "size_type": "0",
+            "mtime": String(entry.mtime ?? 0),
+            "ctime": String(entry.ctime ?? 0),
+            "file_size": String(entry.size ?? 0),
+            "intranet_share_id": String(entry.intranetShareID ?? 0),
+            "width": "88",
+            "height": "88"
+        ]
+        return try await client.getBinary("v1/filemgr/thumbnail", params: params)
+    }
+
+    /// 原图通道：直接返回源文件字节，用来做大图预览。
+    ///
+    /// 和 `download` 拿到的内容一样，但**不需要三步换 `dl_token`**，带会话 token
+    /// 一次就取到。实测 1600×1200 PNG 源图 37334 字节，回来一字节不差。
+    func previewBytes(for entry: FileEntry) async throws -> Data {
+        guard !entry.isDir, !entry.isTag else {
+            throw UgosError.auth("这个条目不能预览")
+        }
+        let params: [String: String] = [
+            "path": entry.path,
+            "type": String(entry.fileType ?? 1),
+            "size_type": "0",
+            "mtime": String(entry.mtime ?? 0),
+            "ctime": String(entry.ctime ?? 0),
+            "file_size": String(entry.size ?? 0),
+            "intranet_share_id": String(entry.intranetShareID ?? 0),
+            "width": "1920",
+            "height": "1080"
+        ]
+        return try await client.getBinary("v1/filemgr/mediaPlayer", params: params)
+    }
+
     // MARK: 写操作
 
     /// 新建目录。NAS 的 `createFolder` 要的是**新目录的完整路径**，不是父目录。

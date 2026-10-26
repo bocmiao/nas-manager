@@ -151,6 +151,15 @@ class UgosClient:
             self._token = ""
             await self.login()
 
+    async def session_token(self) -> str:
+        """当前会话 token。
+
+        给流式/二进制接口用：`get`/`post` 会自动把 token 塞进 query，
+        但 `open_stream` 不会（下载用的是独立 dl_token，不能一概而论），
+        所以那边需要自己取。
+        """
+        return await self._ensure_token()
+
     async def password_token(self, *, refresh: bool = False) -> str:
         """取「本次操作密码令牌」。
 

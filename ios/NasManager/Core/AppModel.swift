@@ -643,6 +643,24 @@ final class AppModel {
         }
     }
 
+    /// 图片缩略图（列表小图标用）。失败一律抛出，由视图层吞掉退回系统图标。
+    @MainActor
+    func fileThumbnail(entry: FileEntry) async throws -> Data {
+        guard let fileService = fileService else { throw UgosError.auth("尚未连接") }
+        return try await fileService.thumbnail(for: entry)
+    }
+
+    /// 原图字节（大图预览用）。走 `mediaPlayer`，不用三步下载链路。
+    @MainActor
+    func filePreview(entry: FileEntry) async throws -> Data {
+        guard let fileService = fileService else { throw UgosError.auth("尚未连接") }
+        do {
+            return try await fileService.previewBytes(for: entry)
+        } catch {
+            throw UgosError.auth(FileService.friendly(error))
+        }
+    }
+
     @MainActor
     func fileFreeSpace(path: String) async throws -> FileSpace {
         guard let fileService = fileService else { throw UgosError.auth("尚未连接") }

@@ -283,6 +283,74 @@ actor UgosClient {
         try await performRaw(path: path, data: data, headers: headers, allowRetry: true)
     }
 
+    /// GET 原始字节，不做 JSON 解析。缩略图这类接口直接回图片。
+    ///
+    /// NAS 侧首次请求会回 **423**（缩略图正在异步生成），过一两秒再取才有内容，
+    /// 所以这里自带退避重试。返回体统一是 JPEG，与源文件后缀无关。
+    func getBinary(
+        _ path: String,
+        params: [String: String] = [:],
+        attempts: Int = 6,
+        retryDelay: TimeInterval = 0.8
+    ) async throws -> Data {
+        var lastError: Error?
+        for attempt in 0..<max(1, attempts) {
+            if token.isEmpty { try await relogin() }
+            var query = params.map { ($0.key, $0.value) }
+            query.append(("token", token))
+            let request = try makeRequest(
+                path: path, method: "GET", queryItems: query, body: nil
+            )
+            let (http, data) = try await rawExecute(request)
+
+            // 423 = Locked，NAS 用它表示「还在转码」，等一下重试
+            if http.statusCode == 423 {
+                lastError = UgosError.business(
+                    code: 423, message: "缩略图生成中", path: path
+                )
+                if attempt < attempts - 1 {
+                    try await Task.sleep(
+                        nanoseconds: UInt64(retryDelay * 1_000_000_000)
+                    )
+                }
+                continue
+            }
+
+            guard (200..<300).contains(http.statusCode) else {
+                // 失败时 NAS 多半回的是 JSON 错误体，能读就读
+                let text = String(data: data, encoding: .utf8) ?? ""
+                let code = Self.businessCode(in: text) ?? http.statusCode
+                let message = Self.msg(in: text) ?? "请求失败（\(http.statusCode)）"
+                let error = UgosError.business(code: code, message: message, path: path)
+                if error.requiresRelogin, attempt < attempts - 1 {
+                    try await relogin()
+                    continue
+                }
+                throw error
+            }
+            guard !data.isEmpty else {
+                throw UgosError.decoding("返回体为空（\(path)）")
+            }
+            return data
+        }
+        throw lastError ?? UgosError.transport("缩略图多次重试仍失败")
+    }
+
+    /// 从 JSON 错误体里扒业务码，扒不到返回 nil
+    private static func businessCode(in text: String) -> Int? {
+        guard let data = text.data(using: .utf8),
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+        else { return nil }
+        return obj["code"] as? Int
+    }
+
+    private static func msg(in text: String) -> String? {
+        guard let data = text.data(using: .utf8),
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+        else { return nil }
+        return (obj["msg"] as? String) ?? (obj["debug"] as? String)
+    }
+
     private func performRaw(
         path: String,
         data: Data,
