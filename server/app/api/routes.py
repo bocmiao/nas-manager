@@ -1,14 +1,19 @@
 """HTTP 路由。"""
 from __future__ import annotations
 
+import logging
+import posixpath
 import time
+from urllib.parse import quote
 
 from fastapi import APIRouter, Body, Depends, HTTPException, Query, Request, status
+from fastapi.responses import StreamingResponse
 
 from ..services.alerts import AlertEngine
 from ..services.backup import BackupService
 from ..services.benchmark import BenchmarkManager, BenchmarkRejected
 from ..services.fans import FanService
+from ..services.files import FileRejected, FileService
 from ..services.health import HealthService
 from ..services.history import HistoryRecorder
 from ..services.images import ImageManager
@@ -24,6 +29,7 @@ from ..services.users import UserService
 from ..services.vms import VmService
 from .deps import (
     get_alerts,
+    get_files,
     get_backup,
     get_benchmark,
     get_fans,
@@ -41,6 +47,8 @@ from .deps import (
     get_vms,
     require_auth,
 )
+
+log = logging.getLogger("api")
 
 router = APIRouter()
 public = APIRouter()
@@ -937,3 +945,149 @@ async def push_test(push: PushService = Depends(get_push)):
         }
     )
     return ok({"delivered": sent, "stats": push.stats()})
+
+
+# ------------------------------------------------------------------ 文件管理
+
+@router.get("/files/roots", dependencies=[Depends(require_auth)])
+async def files_roots(files: FileService = Depends(get_files)):
+    """可浏览的根分类（收藏/个人/共享/用户/设备/标签…）+ 卷列表。
+
+    分类来自 NAS 的 `root_list`，只返回本机真实存在的那几个数字。
+    """
+    return ok(await files.roots())
+
+
+@router.get("/files/list", dependencies=[Depends(require_auth)])
+async def files_list(
+    path: str | None = Query(None, description="/volume1/xxx 形式；与 root_type 二选一"),
+    root_type: int | None = Query(None, description="根分类编号：2 个人 / 3 共享 / 4 用户 …"),
+    page: int = Query(1, ge=1),
+    limit: int = Query(200, ge=1, le=1000),
+    sort: str = Query("name", description="name / size / type / mtime / ctime / atime / dtime"),
+    reverse: bool = Query(False),
+    files: FileService = Depends(get_files),
+):
+    """列目录。
+
+    根级必须给 `root_type`（数字），子目录必须给 `path`；
+    直接传卷路径（如 `/volume1`）会被 NAS 判为越界（`1301 不允许访问`），属正常行为。
+    """
+    try:
+        return ok(await files.list_dir(path=path, root_type=root_type, page=page,
+                                       limit=limit, sort=sort, reverse=reverse))
+    except FileRejected as exc:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, detail=exc.msg) from exc
+
+
+@router.get("/files/download", dependencies=[Depends(require_auth)])
+async def files_download(
+    path: str = Query(..., description="要下载的文件绝对路径"),
+    nas: NasService = Depends(get_nas),
+    files: FileService = Depends(get_files),
+):
+    """流式下载单个文件。
+
+    NAS 侧是三步链路（建任务 → 换 dl_token → 取字节），这里把三步包成一次请求，
+    令牌不外泄，字节直接透传（不落盘、不进内存）。
+    """
+    try:
+        info = await files.download_token(path)
+    except FileRejected as exc:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, detail=exc.msg) from exc
+
+    name = posixpath.basename(info["path"]) or "download"
+    # 中文文件名按 RFC 5987 编码，同时给 ASCII 兜底，避免个别客户端乱码
+    ascii_name = name.encode("ascii", "ignore").decode() or "download"
+    disposition = f"attachment; filename=\"{ascii_name}\"; filename*=UTF-8''{quote(name)}"
+
+    # 必须在返回 StreamingResponse **之前**确认上游可用：
+    # 一旦响应头发出去，再抛异常只会让客户端读到半截就断连（incomplete chunked read）。
+    ctx = nas.client.open_stream("v2/filemgr/downloadFile", {"token": info["token"]})
+    try:
+        resp = await ctx.__aenter__()
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(
+            status.HTTP_502_BAD_GATEWAY, detail=f"连接 NAS 下载端点失败：{exc}"
+        ) from exc
+
+    if resp.status_code != 200:
+        body = await resp.aread()
+        await ctx.__aexit__(None, None, None)
+        log.warning("下载失败 %s HTTP %s %r", info["path"], resp.status_code, body[:200])
+        raise HTTPException(
+            status.HTTP_502_BAD_GATEWAY,
+            detail=f"NAS 下载返回 {resp.status_code}：{body[:120].decode('utf-8', 'replace')}",
+        )
+
+    async def pump():
+        try:
+            async for chunk in resp.aiter_bytes(65536):
+                yield chunk
+        finally:
+            await ctx.__aexit__(None, None, None)
+
+    headers = {
+        "Content-Disposition": disposition,
+        "X-Nas-Path": quote(info["path"]),
+    }
+    length = resp.headers.get("content-length")
+    if length and length.isdigit():
+        headers["Content-Length"] = length
+
+    return StreamingResponse(pump(), media_type="application/octet-stream", headers=headers)
+
+
+@router.post("/files/folder", status_code=status.HTTP_201_CREATED,
+             dependencies=[Depends(require_auth)])
+async def files_create_folder(
+    parent: str = Body(..., embed=True, description="父目录绝对路径"),
+    name: str = Body(..., embed=True, description="新目录名（不含 /）"),
+    files: FileService = Depends(get_files),
+):
+    """新建目录。NAS 的 `createFolder` 要的是新目录完整路径，这里由 parent+name 拼。"""
+    try:
+        return ok(await files.create_folder(parent, name))
+    except FileRejected as exc:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, detail=exc.msg) from exc
+
+
+@router.post("/files/rename", dependencies=[Depends(require_auth)])
+async def files_rename(
+    path: str = Body(..., embed=True),
+    new_name: str = Body(..., embed=True),
+    files: FileService = Depends(get_files),
+):
+    try:
+        return ok(await files.rename(path, new_name))
+    except FileRejected as exc:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, detail=exc.msg) from exc
+
+
+@router.delete("/files", dependencies=[Depends(require_auth)])
+async def files_delete(
+    paths: list[str] = Query(..., description="绝对路径，可重复"),
+    forever: bool = Query(False, description="true=不进回收站，直接删"),
+    files: FileService = Depends(get_files),
+):
+    """删除。
+
+    注意载荷形状：NAS 的 `delPaths` 只认**字符串数组**，传条目对象数组会得到 `9999 操作失败!`。
+    默认进回收站（`forever=false`），与网页端行为一致。
+    """
+    try:
+        return ok(await files.delete(paths, forever=forever))
+    except FileRejected as exc:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, detail=exc.msg) from exc
+
+
+@router.get("/files/space", dependencies=[Depends(require_auth)])
+async def files_space(
+    path: str = Query(..., description="任意可访问路径"),
+    files: FileService = Depends(get_files),
+):
+    """该路径所在卷的剩余字节数。"""
+    try:
+        return ok(await files.free_space(path))
+    except FileRejected as exc:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, detail=exc.msg) from exc

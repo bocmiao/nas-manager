@@ -1,0 +1,311 @@
+"""文件管理：浏览 / 下载 / 新建目录 / 重命名 / 删除。
+
+实测契约（详见 docs/api-verified.md §七，全部在真机上验证过）：
+
+- 根分类：`GET v2/filemgr/getRootDirs?client=pc` → `{root_list: [2,3,...]}`，
+  **只有数字 root_type，没有对象**。数字与分类的对应来自前端 `initCache()`：
+  1 收藏 / 2 个人文件夹 / 3 共享文件夹 / 4 用户文件夹 / 5 远程挂载 /
+  6 外部设备 / 7 镜像(ISO) / 8 共享给我 / 9 标签
+- 卷列表：`GET v1/filemgr/getVolumes` → `{result: [{name, path, fs_type, free, used, all}]}`
+- 目录列表：`POST v2/filemgr/getDirFileListV2`
+  - **根级**传 `root_type`（数字），**子路径**传 `path`（字符串），两者互斥；
+    传 `path` 且路径不在可访问范围内 → `1301 不允许访问`（例如直接传 `/volume1`）
+  - 共享根（root_type=3）需额外 `permission: 4`
+  - 返回 `{left_tree: {...}, right_files: {total, top_path, permission_mask, files: [...]}}`
+  - `top_path` 是树的根，不是当前目录；当前目录要自己记
+  - 条目 `file_type`：**1=目录，0=文件**
+  - 排序 `sort_type`：1 名称 / 2 大小 / 3 类型 / 4 修改时间 / 5 创建时间 / 6 访问时间 / 7 删除时间
+- 下载三步（缺一不可）：
+  1. `POST v2/filemgr/addPathsTask` `{paths:[{path, intranet_share_id}]}` → `{result: <task_uuid>}`
+  2. `GET v2/filemgr/getDownloadToken?task_uuid=&coding=true` → `{dl_token}`
+  3. `GET /ugreen/v2/filemgr/downloadFile?token=<dl_token>` → **原始字节**
+     注意第 3 步用的是 dl_token，**不是**会话 token，前端也关掉了 tokenAuth
+- 新建目录：`POST v2/filemgr/createFolder` `{path: <新目录完整路径>}`，
+  `path` 是**目标目录本身**而不是父目录；已存在 → `1327 存在同名文件夹`
+- 重命名：`POST v2/filemgr/rename` `{path, new_name}` → 返回更新后的条目
+- 删除：`POST v2/filemgr/delPaths` `{paths: [<路径字符串>], forever: bool}`，
+  **paths 必须是字符串数组**，传对象数组 → `9999 操作失败!`
+- 剩余空间：`POST v1/filemgr/getPathFreeSize` `{path}` → `{result: <bytes>}`
+
+只读取不到的信息不做猜测：条目的 `icon`/`icons` 是前端图标编号，这里只透传不解释。
+"""
+from __future__ import annotations
+
+import logging
+import posixpath
+
+from ..cache import TTLCache
+from ..config import Settings
+from ..ugos.client import UgosError
+from .nas import NasService
+
+log = logging.getLogger("files")
+
+# 根分类（前端 initCache 的静态表，实测 root_list 会返回其中的子集）
+ROOT_CATEGORIES: dict[int, tuple[str, str]] = {
+    1: ("collect", "收藏"),
+    2: ("personal", "个人文件夹"),
+    3: ("common", "共享文件夹"),
+    4: ("users", "用户文件夹"),
+    5: ("network", "远程挂载"),
+    6: ("device", "外部设备"),
+    7: ("mirroring", "镜像"),
+    8: ("share", "共享给我"),
+    9: ("label", "标签"),
+}
+
+SORT_TYPES = {1: "name", 2: "size", 3: "type", 4: "mtime", 5: "ctime", 6: "atime", 7: "dtime"}
+SORT_CODES = {v: k for k, v in SORT_TYPES.items()}
+
+FILE_TYPE_DIR = 1
+ROOT_TAG = 9     # 标签根：条目是标签定义，不是文件
+
+# 常见后缀归组，供客户端选图标；纯展示辅助，与 NAS 语义无关
+EXT_GROUPS = {
+    "image": {"jpg", "jpeg", "png", "gif", "webp", "heic", "bmp", "svg", "tiff", "avif"},
+    "video": {"mp4", "mkv", "mov", "avi", "wmv", "flv", "webm", "ts", "m4v", "rmvb"},
+    "audio": {"mp3", "flac", "wav", "aac", "m4a", "ogg", "ape", "wma"},
+    "archive": {"zip", "rar", "7z", "tar", "gz", "bz2", "xz", "iso", "zst"},
+    "document": {"pdf", "doc", "docx", "xls", "xlsx", "ppt", "pptx", "txt", "md",
+                 "csv", "rtf", "epub", "mobi", "log"},
+    "code": {"py", "js", "ts", "json", "yml", "yaml", "sh", "go", "rs", "java",
+             "c", "cpp", "h", "swift", "kt", "html", "css", "sql", "toml", "ini"},
+}
+_EXT_TO_GROUP = {ext: g for g, exts in EXT_GROUPS.items() for ext in exts}
+
+
+class FileRejected(Exception):
+    """请求参数被本地规则拒绝（不发给 NAS）。"""
+
+    def __init__(self, msg: str, code: int = 8001) -> None:
+        super().__init__(msg)
+        self.msg = msg
+        self.code = code
+
+
+def sanitize_path(path: str) -> str:
+    """校验并规范化绝对路径。
+
+    只做本地合法性检查（绝对路径、无 `..`、无空字节），**不做**越权判断——
+    可见范围由 NAS 的权限模型决定（越界会返回 1301）。
+    """
+    if not path or not isinstance(path, str):
+        raise FileRejected("path 不能为空")
+    if "\x00" in path:
+        raise FileRejected("path 含非法字符")
+    if not path.startswith("/"):
+        raise FileRejected("path 必须是绝对路径")
+    norm = posixpath.normpath(path)
+    if norm == ".." or norm.startswith("../") or "/../" in norm:
+        raise FileRejected("path 不允许包含 ..")
+    if norm == "/":
+        raise FileRejected("根目录请用 root_type 浏览，不要传 path=/")
+    return norm
+
+
+def _ext_group(ext: str) -> str:
+    return _EXT_TO_GROUP.get(ext.lower(), "other")
+
+
+def normalize_entry(raw: dict, root_type: int | None = None) -> dict:
+    """把 NAS 条目裁成客户端需要的字段。原始条目约 30 个键，多数是前端内部状态。"""
+    file_type = raw.get("file_type")
+    is_dir = file_type == FILE_TYPE_DIR
+    # root_type=9（标签）返回的是标签本身，没有 file_type，不能被当成 0 号“文件”
+    is_tag = root_type == ROOT_TAG or "tag_id" in raw
+    ext = (raw.get("ext") or "").lstrip(".")
+    return {
+        "name": raw.get("name") or "",
+        "path": raw.get("path") or "",
+        "is_dir": is_dir,
+        "file_type": file_type,
+        "size": int(raw.get("size") or 0),
+        "ext": ext,
+        "ext_group": "folder" if is_dir else _ext_group(ext),
+        "mtime": int(raw.get("mtime") or 0),
+        "ctime": int(raw.get("ctime") or 0),
+        "permission_mask": int(raw.get("permission_mask") or 0),
+        "icon": raw.get("icon"),
+        "intranet_share_id": int(raw.get("intranet_share_id") or 0),
+        "is_mount": bool((raw.get("mount") or {}).get("is_mount")),
+        "recycle_status": raw.get("recycle_status"),
+        "is_tag": is_tag,
+        "tag_id": raw.get("tag_id"),
+        "tag_colour": raw.get("colour"),
+    }
+
+
+class FileService:
+    def __init__(self, nas: NasService, cache: TTLCache, settings: Settings) -> None:
+        self._nas = nas
+        self._cache = cache
+        self._s = settings
+
+    @property
+    def _c(self):
+        return self._nas.client
+
+    # ------------------------------------------------------------- 根与卷
+
+    async def roots(self) -> dict:
+        """可浏览的根分类 + 卷信息。分类只返回本机 root_list 里真实存在的那些。"""
+        raw = await self._c.get("v2/filemgr/getRootDirs", {"client": "pc"})
+        numbers = (raw or {}).get("root_list") or []
+        if not isinstance(numbers, list):
+            numbers = []
+        categories = []
+        for n in numbers:
+            if not isinstance(n, int):
+                continue
+            key, label = ROOT_CATEGORIES.get(n, (f"root{n}", f"未知分类 {n}"))
+            categories.append({"root_type": n, "key": key, "name": label})
+
+        volumes = []
+        try:
+            vraw = await self._c.get("v1/filemgr/getVolumes")
+            for v in (vraw or {}).get("result") or []:
+                total = int(v.get("all") or 0)
+                used = int(v.get("used") or 0)
+                free = int(v.get("free") or 0)
+                volumes.append({
+                    "name": v.get("name"),
+                    "path": v.get("path"),
+                    "fs_type": v.get("fs_type"),
+                    "total": total,
+                    "used": used,
+                    "free": free,
+                    "used_ratio": round(used / total, 4) if total else None,
+                })
+        except UgosError as exc:
+            # 卷信息是锦上添花，取不到不影响浏览
+            log.warning("getVolumes 失败：%s %s", exc.code, exc.msg)
+
+        return {"categories": categories, "volumes": volumes}
+
+    # ------------------------------------------------------------- 列表
+
+    async def list_dir(
+        self,
+        path: str | None = None,
+        root_type: int | None = None,
+        page: int = 1,
+        limit: int = 200,
+        sort: str = "name",
+        reverse: bool = False,
+    ) -> dict:
+        """列目录。根级用 root_type，子路径用 path，二选一。"""
+        if path and root_type is not None:
+            raise FileRejected("path 与 root_type 只能给一个")
+        if not path and root_type is None:
+            raise FileRejected("path 与 root_type 至少给一个")
+
+        page = max(1, int(page))
+        limit = max(1, min(int(limit), 1000))
+        sort_type = SORT_CODES.get(sort, 1)
+
+        body: dict = {
+            "limit": limit,
+            "page": page,
+            "is_shield_recycle": False,
+            "data_type": 2,          # 2 = 只要右侧列表，不要左侧树
+            "left_no_page_show": False,
+            "left_count": 5000,
+            "sort_type": sort_type,
+            "reverse": bool(reverse),
+            "intranet_share_id": 0,
+            "permission": 0,
+            "version": 1,
+            "operate": 0,
+        }
+        if path:
+            body["path"] = sanitize_path(path)
+        else:
+            body["root_type"] = int(root_type)
+            # 共享文件夹根需要 permission=4，否则列不出来（见模块 docstring）
+            if int(root_type) == 3:
+                body["permission"] = 4
+
+        data = await self._c.post("v2/filemgr/getDirFileListV2", body)
+        right = (data or {}).get("right_files") or {}
+        raws = right.get("files") or []
+        entries = [normalize_entry(x, body.get("root_type")) for x in raws
+                   if isinstance(x, dict)]
+
+        total = int(right.get("total") or 0)
+        return {
+            "path": body.get("path"),
+            "root_type": body.get("root_type"),
+            "top_path": right.get("top_path") or "",
+            "permission_mask": int(right.get("permission_mask") or 0),
+            "page": page,
+            "limit": limit,
+            "total": total,
+            "has_more": page * limit < total,
+            "sort": SORT_TYPES.get(sort_type, "name"),
+            "reverse": bool(reverse),
+            "entries": entries,
+        }
+
+    # ------------------------------------------------------------- 下载
+
+    async def download_token(self, path: str) -> dict:
+        """走完前两步，拿到一次性下载令牌。第三步由路由层流式转发。"""
+        clean = sanitize_path(path)
+        task = await self._c.post(
+            "v2/filemgr/addPathsTask",
+            {"paths": [{"path": clean, "intranet_share_id": 0}]},
+        )
+        uuid = (task or {}).get("result")
+        if not uuid:
+            raise FileRejected("NAS 未返回下载任务号", code=9999)
+
+        tok = await self._c.get(
+            "v2/filemgr/getDownloadToken",
+            {"task_uuid": str(uuid), "coding": "true", "is_livephoto": "false"},
+        )
+        token = (tok or {}).get("dl_token")
+        if not token:
+            raise FileRejected("NAS 未返回下载令牌", code=9999)
+        return {"path": clean, "token": token, "task_uuid": str(uuid)}
+
+    # ------------------------------------------------------------- 写操作
+
+    async def create_folder(self, parent: str, name: str) -> dict:
+        """建目录。`path` 传**新目录的完整路径**——把父目录传进去只会得到 1327。"""
+        if not name or "/" in name or "\x00" in name:
+            raise FileRejected("目录名不能为空且不能包含 /")
+        if name in (".", ".."):
+            raise FileRejected("目录名非法")
+        parent_clean = sanitize_path(parent)
+        target = posixpath.join(parent_clean, name)
+        data = await self._c.post("v2/filemgr/createFolder", {"path": target})
+        return normalize_entry(data or {})
+
+    async def rename(self, path: str, new_name: str) -> dict:
+        if not new_name or "/" in new_name or "\x00" in new_name:
+            raise FileRejected("新名称不能为空且不能包含 /")
+        if new_name in (".", ".."):
+            raise FileRejected("新名称非法")
+        clean = sanitize_path(path)
+        data = await self._c.post("v2/filemgr/rename", {"path": clean, "new_name": new_name})
+        return normalize_entry(data or {})
+
+    async def delete(self, paths: list[str], forever: bool = False) -> dict:
+        """删除。`paths` 必须是字符串数组，传对象数组 NAS 会报 9999。"""
+        if not paths:
+            raise FileRejected("paths 不能为空")
+        if not isinstance(paths, list):
+            raise FileRejected("paths 必须是数组")
+        cleaned = [sanitize_path(p) for p in paths if isinstance(p, str)]
+        if len(cleaned) != len(paths):
+            raise FileRejected("paths 里有非字符串项")
+        await self._c.post("v2/filemgr/delPaths", {"paths": cleaned, "forever": bool(forever)})
+        return {"deleted": cleaned, "forever": bool(forever)}
+
+    # ------------------------------------------------------------- 空间
+
+    async def free_space(self, path: str) -> dict:
+        clean = sanitize_path(path)
+        data = await self._c.post("v1/filemgr/getPathFreeSize", {"path": clean})
+        free = int((data or {}).get("result") or 0)
+        return {"path": clean, "free": free}

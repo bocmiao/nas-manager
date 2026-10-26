@@ -96,6 +96,7 @@ class Settings(BaseSettings):
     ttl_sessions: float = 5.0
     ttl_backup: float = 30.0
     ttl_fans: float = 5.0
+    ttl_files: float = 10.0
     ttl_vm: float = 300.0
 
     # --- 磁盘测速 ---

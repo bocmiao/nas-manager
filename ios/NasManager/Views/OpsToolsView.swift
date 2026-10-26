@@ -69,6 +69,17 @@ struct OpsToolsView: View {
 
             Section {
                 NavigationLink {
+                    FilesView(model: model)
+                } label: {
+                    OpsRow(
+                        icon: "folder",
+                        tint: .indigo,
+                        title: "文件管理",
+                        detail: "浏览共享与个人目录，下载 / 重命名 / 删除文件"
+                    )
+                }
+
+                NavigationLink {
                     ImagesView(model: model)
                 } label: {
                     OpsRow(
@@ -92,7 +103,7 @@ struct OpsToolsView: View {
             } header: {
                 Text("容器与存储")
             } footer: {
-                Text("容器页与存储页仍保留各自入口，这里只是汇总，方便从设置页直接进入。")
+                Text("容器页与存储页仍保留各自入口，这里只是汇总，方便从设置页直接进入。文件管理会直接对 NAS 上的文件做写操作，删除默认进回收站。")
             }
         }
         .listStyle(.plain)

@@ -22,6 +22,7 @@ from .services.alerts import AlertEngine
 from .services.backup import BackupService
 from .services.benchmark import BenchmarkManager
 from .services.fans import FanService
+from .services.files import FileService
 from .services.health import HealthService
 from .services.history import HistoryRecorder
 from .services.images import ImageManager
@@ -88,6 +89,7 @@ async def lifespan(app: FastAPI):
     app.state.health = HealthService(app.state.nas, settings)
     app.state.sessions = SessionService(app.state.nas, app.state.cache, settings, app.state.logs)
     app.state.fans = FanService(app.state.nas, app.state.cache, settings)
+    app.state.files = FileService(app.state.nas, app.state.cache, settings)
     app.state.backup = BackupService(app.state.nas, app.state.cache, settings)
     app.state.power_plan = PowerPlanService(app.state.nas, settings)
     app.state.vms = VmService(app.state.nas, app.state.cache, settings)

@@ -77,6 +77,7 @@ final class AppModel {
     private var storage: StorageService?
     private var imageService: ImageService?
     private var snapshotService: SnapshotService?
+    private var fileService: FileService?
     private var firmwareService: FirmwareService?
     private var logService: LogService?
     private var sessionService: SessionService?
@@ -196,6 +197,7 @@ final class AppModel {
         storage = StorageService(client: newClient)
         imageService = ImageService(client: newClient)
         snapshotService = SnapshotService(client: newClient)
+        fileService = FileService(client: newClient, endpoint: endpoint)
         firmwareService = FirmwareService(client: newClient)
         logService = LogService(client: newClient)
         sessionService = SessionService(client: newClient)
@@ -235,6 +237,7 @@ final class AppModel {
         storage = nil
         imageService = nil
         snapshotService = nil
+        fileService = nil
         firmwareService = nil
         logService = nil
         sessionService = nil
@@ -416,6 +419,7 @@ final class AppModel {
             storage = StorageService(client: newClient)
             imageService = ImageService(client: newClient)
             snapshotService = SnapshotService(client: newClient)
+            fileService = FileService(client: newClient, endpoint: alternate.endpoint)
             firmwareService = FirmwareService(client: newClient)
             logService = LogService(client: newClient)
             sessionService = SessionService(client: newClient)
@@ -552,6 +556,94 @@ final class AppModel {
     func rollbackSnapshot(_ item: SnapshotItem) async throws {
         guard let snapshotService = snapshotService else { throw UgosError.auth("尚未连接") }
         try await snapshotService.restore(item)
+    }
+
+    // MARK: 文件管理
+
+    /// 根分类 + 卷容量。错误文案统一走 FileService.friendly，把 1301 之类翻成人话。
+    @MainActor
+    func fileRoots() async throws -> FileRoots {
+        guard let fileService = fileService else { throw UgosError.auth("尚未连接") }
+        do {
+            return try await fileService.roots()
+        } catch {
+            throw UgosError.auth(FileService.friendly(error))
+        }
+    }
+
+    @MainActor
+    func fileList(
+        path: String?,
+        rootType: Int?,
+        page: Int = 1,
+        limit: Int = 200,
+        sort: FileSort = .name,
+        reverse: Bool = false
+    ) async throws -> FileListing {
+        guard let fileService = fileService else { throw UgosError.auth("尚未连接") }
+        do {
+            return try await fileService.list(
+                path: path,
+                rootType: rootType,
+                page: page,
+                limit: limit,
+                sort: sort,
+                reverse: reverse
+            )
+        } catch {
+            throw UgosError.auth(FileService.friendly(error))
+        }
+    }
+
+    @MainActor
+    func createFolder(parent: String, name: String) async throws -> FileEntry? {
+        guard let fileService = fileService else { throw UgosError.auth("尚未连接") }
+        do {
+            return try await fileService.createFolder(parent: parent, name: name)
+        } catch {
+            throw UgosError.auth(FileService.friendly(error))
+        }
+    }
+
+    @MainActor
+    func renameFile(path: String, newName: String) async throws -> FileEntry? {
+        guard let fileService = fileService else { throw UgosError.auth("尚未连接") }
+        do {
+            return try await fileService.rename(path: path, newName: newName)
+        } catch {
+            throw UgosError.auth(FileService.friendly(error))
+        }
+    }
+
+    /// 删除文件。默认进回收站，forever 为 true 才直接删。
+    @MainActor
+    func deleteFiles(paths: [String], forever: Bool = false) async throws -> FileDeleteResult {
+        guard let fileService = fileService else { throw UgosError.auth("尚未连接") }
+        do {
+            return try await fileService.delete(paths: paths, forever: forever)
+        } catch {
+            throw UgosError.auth(FileService.friendly(error))
+        }
+    }
+
+    @MainActor
+    func downloadFile(path: String) async throws -> Data {
+        guard let fileService = fileService else { throw UgosError.auth("尚未连接") }
+        do {
+            return try await fileService.download(path: path)
+        } catch {
+            throw UgosError.auth(FileService.friendly(error))
+        }
+    }
+
+    @MainActor
+    func fileFreeSpace(path: String) async throws -> FileSpace {
+        guard let fileService = fileService else { throw UgosError.auth("尚未连接") }
+        do {
+            return try await fileService.freeSpace(path: path)
+        } catch {
+            throw UgosError.auth(FileService.friendly(error))
+        }
     }
 
     // MARK: 运维工具（只读）

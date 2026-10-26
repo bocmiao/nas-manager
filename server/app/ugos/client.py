@@ -229,6 +229,15 @@ class UgosClient:
             return await self.delete(path, body, params, retry=False, headers=headers)
         raise UgosError(code, data.get("msg") or "", path, data.get("debug") or "")
 
+    def open_stream(self, path: str, params: dict | None = None):
+        """给不出来自 NAS 的二进制流（文件下载）。
+
+        返回 httpx 的流式上下文，调用方负责 `async with`。
+        **不带 token**：文件下载走 dl_token（`?token=<dl_token>`），
+        会话 token 在下载端点是无效的（前端同样关掉了 tokenAuth）。
+        """
+        return self._http.stream("GET", self._url(path), params=dict(params or {}))
+
     async def post_privileged(self, path: str, body: dict | None = None):
         """需要二级密码确认的写操作：自动附带 X-CurPass-Token。"""
         tok = await self.password_token()

@@ -8,6 +8,7 @@ from ..services.alerts import AlertEngine
 from ..services.backup import BackupService
 from ..services.benchmark import BenchmarkManager
 from ..services.fans import FanService
+from ..services.files import FileService
 from ..services.health import HealthService
 from ..services.history import HistoryRecorder
 from ..services.images import ImageManager
@@ -80,6 +81,10 @@ def get_fans(request: Request) -> FanService:
 
 def get_backup(request: Request) -> BackupService:
     return request.app.state.backup
+
+
+def get_files(request: Request) -> FileService:
+    return request.app.state.files
 
 
 def get_power_plan(request: Request) -> PowerPlanService:
