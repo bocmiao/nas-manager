@@ -278,6 +278,96 @@ struct ContainerList: Decodable {
     let result: [Container]?
 }
 
+/// 容器端口映射的一条记录（`portMapping[]` 元素）。
+///
+/// 实测坑：`nasPort` 的**类型不稳定**——同一台设备上，有的容器给 `"666"`（字符串），
+/// 有的给 `8090`（数字）。两种都必须吃下，否则整个容器列表解码失败。
+struct ContainerPort: Decodable, Hashable, Identifiable {
+    /// 宿主机（NAS）上的端口
+    let nasPort: Int
+    /// 容器内端口，缺省时按等于 `nasPort` 处理
+    let containerPort: Int?
+    /// `tcp` / `udp`
+    let portType: String
+
+    var id: String { "\(portType)/\(nasPort)" }
+
+    var isTCP: Bool { portType.lowercased() == "tcp" }
+
+    enum CodingKeys: String, CodingKey {
+        case nasPort, containerPort, portType
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        guard let nas = ContainerPort.flexibleInt(c, key: .nasPort), nas > 0, nas <= 65535 else {
+            throw DecodingError.dataCorruptedError(
+                forKey: .nasPort,
+                in: c,
+                debugDescription: "nasPort 缺失或超出 1-65535"
+            )
+        }
+        nasPort = nas
+        containerPort = ContainerPort.flexibleInt(c, key: .containerPort)
+        let type: String? = (try? c.decodeIfPresent(String.self, forKey: .portType)) ?? nil
+        if let type, !type.isEmpty {
+            portType = type
+        } else {
+            portType = "tcp"
+        }
+    }
+
+    init(nasPort: Int, containerPort: Int? = nil, portType: String = "tcp") {
+        self.nasPort = nasPort
+        self.containerPort = containerPort
+        self.portType = portType
+    }
+
+    private static func flexibleInt(
+        _ container: KeyedDecodingContainer<CodingKeys>,
+        key: CodingKeys
+    ) -> Int? {
+        if let value: Int = (try? container.decodeIfPresent(Int.self, forKey: key)) ?? nil {
+            return value
+        }
+        if let text: String = (try? container.decodeIfPresent(String.self, forKey: key)) ?? nil {
+            return Int(text.trimmingCharacters(in: .whitespaces))
+        }
+        if let number: Double = (try? container.decodeIfPresent(Double.self, forKey: key)) ?? nil {
+            return Int(number)
+        }
+        return nil
+    }
+}
+
+/// `ShowContainerDetailListV2` 的一行：只取列表接口拿不到的运行时字段。
+///
+/// 为什么需要它：`ContainerListV2` 的返回里**没有** `portMapping`，
+/// 端口映射只在明细接口里。一次请求可取全部容器，不必逐个查详情。
+struct ContainerRuntime: Decodable {
+    let containerId: String?
+    let ports: [ContainerPort]
+    /// NAS 上可用的 IP 列表，部分固件为空
+    let nasIPs: [String]
+
+    enum CodingKeys: String, CodingKey {
+        case containerId
+        case ports = "portMapping"
+        case nasIPs
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        containerId = try c.decodeIfPresent(String.self, forKey: .containerId)
+        ports = (try? c.decodeIfPresent([ContainerPort].self, forKey: .ports)) ?? nil ?? []
+        nasIPs = (try? c.decodeIfPresent([String].self, forKey: .nasIPs)) ?? nil ?? []
+    }
+}
+
+struct ContainerRuntimeList: Decodable {
+    let result: [ContainerRuntime]?
+}
+
 struct Container: Decodable, Identifiable {
     let name: String?
     let containerId: String?
@@ -287,9 +377,19 @@ struct Container: Decodable, Identifiable {
     /// 列表接口部分固件会带资源占用；字段类型不稳定，用宽松解析，取不到就显示 “-”
     let cpuPercent: Double?
     let memPercent: Double?
+    /// 端口映射，来自明细接口合并（列表接口不返回）
+    var ports: [ContainerPort] = []
+    /// NAS 可用 IP，来自明细接口合并
+    var nasIPs: [String] = []
 
     var id: String { containerId ?? name ?? "-" }
     var isRunning: Bool { (status ?? "").lowercased() == "running" }
+
+    /// 可以尝试当作 Web 应用打开的端口：TCP 且高于 0。
+    /// 这里只做「值得一试」的筛选，是不是 HTTP 服务要靠实际探测判断。
+    var webCandidatePorts: [ContainerPort] {
+        ports.filter { $0.isTCP && $0.nasPort > 0 }
+    }
 
     enum CodingKeys: String, CodingKey {
         case name, status

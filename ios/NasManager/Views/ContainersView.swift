@@ -7,7 +7,17 @@ private enum ContainerAction {
     case restart
 }
 
-/// 容器页：列表 + 启停/重启 + 日志
+/// 待打开的内置浏览器面板
+private struct ContainerWebTarget: Identifiable {
+    let containerName: String
+    let nasHost: String
+    let candidates: [ContainerWebCandidate]
+    let start: ContainerWebCandidate
+
+    var id: String { "\(containerName)#\(start.id)" }
+}
+
+/// 容器页：列表 + 启停/重启 + 日志 + 在应用内打开 Web UI
 struct ContainersView: View {
     let model: AppModel
 
@@ -17,6 +27,9 @@ struct ContainersView: View {
     @State private var busyId: String?
     @State private var actionError: String?
     @State private var showingImages = false
+    @State private var webTarget: ContainerWebTarget?
+    @State private var probingId: String?
+    @State private var webError: String?
 
     var body: some View {
         NavigationStack {
@@ -76,12 +89,26 @@ struct ContainersView: View {
             .sheet(item: $logTarget) { container in
                 ContainerLogSheet(model: model, container: container)
             }
+            .sheet(item: $webTarget) { target in
+                ContainerBrowserSheet(
+                    containerName: target.containerName,
+                    nasHost: target.nasHost,
+                    candidates: target.candidates,
+                    startAt: target.start,
+                    onClose: { webTarget = nil }
+                )
+            }
             .alert("操作失败", isPresented: actionErrorBinding) {
                 Button("好", role: .cancel) {
                     actionError = nil
                 }
             } message: {
                 Text(actionError ?? "")
+            }
+            .alert("打不开这个容器", isPresented: webErrorBinding) {
+                Button("好", role: .cancel) { webError = nil }
+            } message: {
+                Text(webError ?? "")
             }
         }
     }
@@ -121,6 +148,15 @@ struct ContainersView: View {
         )
     }
 
+    private var webErrorBinding: Binding<Bool> {
+        Binding(
+            get: { webError != nil },
+            set: { visible in
+                if !visible { webError = nil }
+            }
+        )
+    }
+
     // MARK: 行
 
     private func containerRow(_ container: Container) -> some View {
@@ -141,10 +177,16 @@ struct ContainersView: View {
                     Spacer(minLength: 0)
                 }
 
-                Text(container.imageName ?? "-")
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
+                HStack(spacing: 4) {
+                    Text(container.imageName ?? "-")
+                        .lineLimit(1)
+                    if !container.ports.isEmpty {
+                        Text("·")
+                        Text(portSummary(container))
+                    }
+                }
+                .font(.caption2)
+                .foregroundStyle(.secondary)
 
                 HStack(spacing: 12) {
                     Label(Format.percent(container.cpuPercent, digits: 1), systemImage: "cpu")
@@ -158,7 +200,38 @@ struct ContainersView: View {
                 .foregroundStyle(.secondary)
             }
 
+            if canOpenInApp(container) {
+                Button {
+                    openInApp(container)
+                } label: {
+                    Group {
+                        if probingId == container.id {
+                            ProgressView()
+                                .scaleEffect(0.7)
+                        } else {
+                            Image(systemName: "safari")
+                                .font(.title3)
+                        }
+                    }
+                    .frame(width: 26, height: 26)
+                }
+                .buttonStyle(.borderless)
+                .tint(.accentColor)
+                .disabled(probingId != nil)
+                .accessibilityLabel("在应用内打开 \(container.name ?? "该容器")")
+            }
+
             Menu {
+                if canOpenInApp(container) {
+                    Button {
+                        openInApp(container)
+                    } label: {
+                        Label("在应用内打开", systemImage: "safari")
+                    }
+                } else if let reason = ContainerWebResolver.blockReason(for: container) {
+                    Text(reason)
+                }
+
                 Button {
                     logTarget = container
                 } label: {
@@ -212,6 +285,49 @@ struct ContainersView: View {
                 actionError = error.localizedDescription
             }
             busyId = nil
+        }
+    }
+
+    // MARK: 在应用内打开
+
+    /// 端口摘要：只列宿主机端口，容器内端口对「能不能打开」没意义
+    private func portSummary(_ container: Container) -> String {
+        let ports = container.ports.map { String($0.nasPort) }
+        return ports.isEmpty ? "" : "端口 \(ports.joined(separator: ","))"
+    }
+
+    /// 有没有必要显示「打开」入口：必须有 Web 候选端口且容器在跑。
+    /// 真正是不是网页服务要点了才知道（探测有成本，不适合列表里批量做）。
+    private func canOpenInApp(_ container: Container) -> Bool {
+        ContainerWebResolver.blockReason(for: container) == nil
+    }
+
+    private func openInApp(_ container: Container) {
+        guard probingId == nil else { return }
+        guard let host = model.connectedHost, !host.isEmpty else {
+            webError = "尚未连接到 NAS，无法确定访问地址"
+            return
+        }
+
+        probingId = container.id
+        Task {
+            let outcome = await ContainerWebResolver.openTarget(for: container, host: host)
+            probingId = nil
+            switch outcome {
+            case let .ready(start, all):
+                webTarget = ContainerWebTarget(
+                    containerName: container.name ?? "容器",
+                    nasHost: host,
+                    candidates: all,
+                    start: start
+                )
+            case let .notWeb(text):
+                webError = "\(text)\n\n如果这个容器本身就不是网页应用，忽略这条提示即可。"
+            case let .unreachable(text):
+                webError = "\(text)\n\n当前连接的是 \(host)。如果在外部网络访问，需要在路由器上把这个端口转发到 NAS。"
+            case let .blocked(text):
+                webError = text
+            }
         }
     }
 }

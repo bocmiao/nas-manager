@@ -623,6 +623,7 @@ class NasService:
                     "net_tx_bytes": d.get("upstreamTraffic"),
                     "net_rx_bytes": d.get("downstreamTraffic"),
                     "ports": d.get("portMapping") or [],
+                    "nas_ips": [ip for ip in (d.get("nasIPs") or []) if isinstance(ip, str)],
                     "created_at": c.get("createAt"),
                     "application": c.get("application") or "",
                 }
@@ -770,6 +771,131 @@ class NasService:
                 "reason": "UGOS Docker 应用未暴露 compose 读取端点；"
                           "compose 文件仅存于 NAS 磁盘，需用文件管理接口读取",
             },
+            "collected_at": int(time.time()),
+        }
+
+    async def container_access_link(self, port: int) -> dict:
+        """容器端口的访问规则。
+
+        实测契约（`GET v1/docker/container/GetContainerAccessLinkInfo?port=<宿主端口>`）：
+        返回的是**规则配置**，不是现成 URL。能落成地址的只有
+        `rules[].portAppAccess = {port, httpsEnable, httpsPort, urlPath}`。
+
+        `accessType` / `linkType` 的取值语义尚未从 bundle 完全确认，
+        因此这里**原样透出**，不做猜测性翻译。
+        """
+        if not 0 < port <= 65535:
+            raise ValueError("port 需在 1-65535")
+        raw = await self._c.get(
+            "v1/docker/container/GetContainerAccessLinkInfo", {"port": port}
+        ) or {}
+
+        rules = []
+        for r in raw.get("rules") or []:
+            if not isinstance(r, dict):
+                continue
+            access = r.get("portAppAccess") or {}
+            docker_access = r.get("dockerAccess") or {}
+            rules.append(
+                {
+                    "link_type": r.get("linkType"),
+                    "access_type": r.get("accessType"),
+                    "auth_required": bool(r.get("isAuthRequired")),
+                    "remote_disabled": bool(r.get("disableRemoteAccess")),
+                    "port": access.get("port") or docker_access.get("port"),
+                    "https_enabled": bool(access.get("httpsEnable")),
+                    "https_port": access.get("httpsPort") or None,
+                    "url_path": access.get("urlPath") or "",
+                }
+            )
+        return {
+            "port": port,
+            "rules": rules,
+            "supports": raw.get("supports") or [],
+            "open_type": raw.get("openType") or "",
+        }
+
+    async def container_web_access(self, container_id: str) -> dict:
+        """容器 Web UI 的候选访问地址。
+
+        为什么需要这一层：`portMapping` 只说明「宿主端口 → 容器端口」，
+        **不说明该端口是不是 HTTP 服务**——同一台设备上既有返回 HTML 的面板，
+        也有 Minecraft（25565）这类纯 TCP 服务。所以这里只负责把**地址候选**拼好，
+        到底哪个能打开，由客户端实际探测决定，不在这里瞎猜。
+        """
+        detail = await self.container_detail(container_id)
+        host = self._s.ugos_host
+        # IPv6 字面量必须加方括号，否则 host:port 会被切错
+        if ":" in host and not host.startswith("["):
+            host_part = f"[{host}]"
+        else:
+            host_part = host
+
+        items = []
+        for p in detail.get("ports") or []:
+            try:
+                nas_port = int(p.get("nas_port"))
+            except (TypeError, ValueError):
+                continue
+            if not 0 < nas_port <= 65535:
+                continue
+            protocol = str(p.get("protocol") or "tcp").lower()
+            if protocol != "tcp":
+                # UDP 端口不可能承载 Web UI，直接排除
+                continue
+
+            path = ""
+            https_enabled = False
+            https_port_raw = None
+            remote_disabled = False
+            auth_required = False
+            try:
+                link = await self.container_access_link(nas_port)
+            except Exception as exc:  # noqa: BLE001 - 规则取不到不影响地址本身
+                log.warning("容器访问规则获取失败（port=%s）：%s", nas_port, exc)
+                link = {"rules": []}
+
+            for rule in link.get("rules") or []:
+                if rule.get("url_path") and not path:
+                    path = rule["url_path"]
+                if rule.get("https_enabled"):
+                    https_enabled = True
+                    https_port_raw = rule.get("https_port") or https_port_raw
+                remote_disabled = remote_disabled or bool(rule.get("remote_disabled"))
+                auth_required = auth_required or bool(rule.get("auth_required"))
+
+            if path and not path.startswith("/"):
+                path = "/" + path
+            suffix = path or "/"
+
+            urls = [f"http://{host_part}:{nas_port}{suffix}"]
+            if https_enabled:
+                try:
+                    https_port = int(https_port_raw)
+                except (TypeError, ValueError):
+                    https_port = nas_port
+                urls.append(f"https://{host_part}:{https_port}{suffix}")
+
+            items.append(
+                {
+                    "nas_port": nas_port,
+                    "container_port": p.get("container_port"),
+                    "protocol": protocol,
+                    "urls": urls,
+                    "https_enabled": https_enabled,
+                    "url_path": path,
+                    "remote_disabled": remote_disabled,
+                    "auth_required": auth_required,
+                }
+            )
+
+        return {
+            "container_id": container_id,
+            "container_name": detail.get("name"),
+            "running": detail.get("running"),
+            "host": host,
+            "ports": items,
+            "note": "端口地址可达不代表一定是网页服务，打开前应实际探测",
             "collected_at": int(time.time()),
         }
 

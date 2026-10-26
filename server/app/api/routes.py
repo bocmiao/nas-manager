@@ -492,6 +492,20 @@ async def container_detail(container_id: str, nas: NasService = Depends(get_nas)
         raise HTTPException(status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
 
 
+@router.get("/containers/{container_id}/access", dependencies=[Depends(require_auth)])
+async def container_access(container_id: str, nas: NasService = Depends(get_nas)):
+    """容器 Web UI 的候选访问地址。
+
+    只拼地址，不做可达性探测——探测由客户端做（服务端探测容易变成 SSRF 入口，
+    而且慢）。响应里的 `ports[].urls` 是候选，`remote_disabled` 为真表示
+    NAS 层已禁止该端口的远程访问。
+    """
+    try:
+        return ok(await nas.container_web_access(container_id))
+    except ValueError as exc:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+
+
 # ------------------------------------------------------------------ 镜像
 
 @router.get("/docker/images", dependencies=[Depends(require_auth)])

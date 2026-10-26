@@ -12,13 +12,37 @@ final class DockerService {
         self.client = client
     }
 
+    /// 容器列表。
+    ///
+    /// 列表接口 `ContainerListV2` 只给 9 个基础字段，**不含端口映射**。
+    /// 端口在 `ShowContainerDetailListV2` 里，且该接口一次可取全部容器，
+    /// 所以这里合并一次即可，不需要逐容器调 `GetContainerById`。
+    /// 明细失败不影响列表本身——端口只是「能否打开 Web UI」的增益信息。
     func containers() async throws -> [Container] {
         let list = try await client.postDecodable(
             ContainerList.self,
             path: "v1/docker/container/ContainerListV2",
             json: ["PageNum": 1, "PageSize": 200]
         )
-        return list.result ?? []
+        var items = list.result ?? []
+
+        if let detail = try? await client.postDecodable(
+            ContainerRuntimeList.self,
+            path: "v1/docker/container/ShowContainerDetailListV2",
+            json: ["PageNum": 1, "PageSize": 200]
+        ), let rows = detail.result {
+            var byId: [String: ContainerRuntime] = [:]
+            for row in rows {
+                guard let cid = row.containerId, !cid.isEmpty else { continue }
+                byId[cid] = row
+            }
+            for index in items.indices {
+                guard let cid = items[index].containerId, let runtime = byId[cid] else { continue }
+                items[index].ports = runtime.ports
+                items[index].nasIPs = runtime.nasIPs
+            }
+        }
+        return items
     }
 
     func start(_ containerId: String) async throws {

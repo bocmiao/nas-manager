@@ -100,6 +100,13 @@ final class AppModel {
     /// 部分数据源加载失败的说明。空数组表示全部成功，界面据此区分「真的没有」和「没读到」
     var partialErrors: [String] = []
 
+    /// 当前生效的 NAS 主机地址。
+    ///
+    /// 给「在应用内打开容器 Web UI」用：容器端口是宿主机端口，所以访问地址必须是
+    /// **当前正在连的那台 NAS**。内网连的就是内网地址，切到公网就跟着变成公网地址，
+    /// 不需要单独再配一份。
+    var connectedHost: String? { activeHost }
+
     init() {
         let defaults = UserDefaults.standard
         let storedHost = defaults.string(forKey: SettingsKeys.internalHost)

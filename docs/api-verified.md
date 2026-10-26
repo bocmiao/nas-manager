@@ -242,6 +242,7 @@ X-CurPass-Token: <RSA 加密后的账号密码>
 | GET | `v1/docker/view/ObtainOverviewInfo` | **Docker 总览**：引擎统计 + `overviewContainers[]`（仅运行中） |
 | GET | `v1/docker/view/GetEngineStatus` | `{"result": "online"}` |
 | GET | `v1/docker/container/GetContainerById?containerId=<id>` | 容器详情（环境变量、网络、端口、限制），详见下方 |
+| GET | `v1/docker/container/GetContainerAccessLinkInfo?port=<宿主端口>` | **容器访问规则**，参数是宿主机端口（不是 containerId）。返回 `rules[]`，见下方 |
 | GET | `v1/docker/container/ShowCpu` / `ShowMemory` | **宿主机级** CPU/内存，非容器级（传 containerId 无效） |
 | — | `v1/docker/container/AddTerminal` / `DelTerminal` | **容器内终端** |
 | — | `v1/docker/view/GetEngineStatus` / `GetRegistryMirrors` / `SetRegistryMirrors` | Docker 引擎与镜像加速配置 |
@@ -278,7 +279,63 @@ X-CurPass-Token: <RSA 加密后的账号密码>
 | `cpuLimit` / `memLimit` / `noRestrictions` / `privilegedMode` | 资源与权限 |
 | `containerRunCommand` | 运行命令（本机多为 `null`） |
 
-`ShowContainerDetailListV2` 的 `volumes` / `portMapping` 与上面同构，但 `nasPort` / `containerPort` 是**字符串**。
+`ShowContainerDetailListV2` 的 `volumes` / `portMapping` 与上面同构，但 `nasPort` / `containerPort` 的
+**类型不稳定**——同一台设备上，`safewoo-v2ray-mono` 给 `"666"`（字符串），`halo` 给 `8090`（数字）。
+解码时必须两种都吃下，否则整个容器列表会因为一个容器解析失败而全灭（踩坑 72）。
+
+`ContainerListV2` **不返回 `portMapping`**，端口只在 `ShowContainerDetailListV2` 和 `GetContainerById` 里有。
+好消息是前者一次就能取全部容器，不用逐个调详情。
+
+#### 在应用内打开容器 Web UI（2026-10-26 实测）
+
+需求来源：装到 Docker 里的面板（青龙、Halo、qBittorrent…）想在 App 里直接打开操作。
+
+结论：**可行，路径是「宿主端口直连」**，官方自己也是这么做的。
+
+`GetContainerAccessLinkInfo?port=<宿主端口>` 返回的是**访问规则配置**，不是现成 URL：
+
+```json
+{
+  "rules": [
+    {"linkType": 1, "accessType": 4, "dockerAccess": {"port": "5777"},
+     "isAuthRequired": false, "disableRemoteAccess": null},
+    {"linkType": 2, "accessType": 1,
+     "portAppAccess": {"port": "5777", "httpsEnable": false,
+                       "httpsPort": "", "urlPath": "", "linkType": 2}}
+  ],
+  "openType": "",
+  "supports": ["pc", "app"]
+}
+```
+
+能落成地址的只有 `portAppAccess` 里的四个字段：
+
+| 字段 | 用途 |
+|---|---|
+| `port` | 对外端口 |
+| `httpsEnable` / `httpsPort` | 是否是 https、https 用哪个端口（可能和 http 不同） |
+| `urlPath` | **子路径**，有些应用的 UI 不在根路径，必须拼上 |
+
+`linkType` / `accessType` 的取值语义（1/2/3/4、1/4/5）**尚未从 bundle 完全确认**，
+因此中间层原样透出，不做猜测性翻译。`disableRemoteAccess` 非空表示该链路禁用了远程访问。
+
+可达性实测（同一台设备，16 个容器）：
+
+| 容器类型 | 宿主端口 | 状态 | `http://<nas>:<port>/` 实测 |
+|---|---|---|---|
+| 自建面板类应用 | 13888 | running | **200 + `text/html`，7255 字节真实页面** |
+| 任务调度面板 | 5777 | running | 连不上（容器在跑但端口未响应，可能应用自身没起 Web） |
+| 游戏服务端 | 25565 | running | 连不上——**Minecraft 是纯 TCP 协议，不是 HTTP** |
+| 博客 CMS | 8090 | exited | Connection refused |
+| 业务应用 | 3100 | exited | Connection refused |
+| 代理服务端 | 666 | exited | Connection refused |
+
+**这条实测最有价值的结论：端口通 ≠ 能当网页打开。** 16 个容器里 10 个根本没映射端口，
+映射了端口的 6 个里只有 1 个是真 HTTP 服务。所以打开前必须先探测，否则用户点进去只会白屏。
+
+服务端只负责拼地址、不负责探测（服务端探测等于开了个 SSRF 口子，而且慢）；
+探测放在客户端：先 `http://host:port/`，拿不到 HTTP 响应再试 `https://host:port/`，
+两者都失败时按错误类型区分「端口不通」和「端口通但不是 HTTP」。
 
 ### 文件管理（2026-10-26 全链路真机验证）
 
@@ -903,3 +960,26 @@ v1/vm/info   v1/vm/snapshot/list      v1/kvm/vm/list
 71. **预检端点不适合当"文件是否存在"的探针**：`v1/filemgr/fileUpload` 传空 body 返回
     `1005 参数错误 request message format error`，因为它的正常形态是 multipart。
     判断同名文件直接列目录即可（`getDirFileListV2`）。
+
+## 四之六、容器 Web 访问踩坑（72~76，2026-10-26 实测）
+
+72. **`portMapping` 里的 `nasPort` 类型不稳定，同一台设备上混用**。
+    实测同一份列表里，有的容器给 `"666"`（字符串），有的给 `8090`（数字），
+    而 `GetContainerById` 和 `ShowContainerDetailListV2` 两个接口都是这样。
+    Swift 侧用 `Int` 直接解会整个列表解码失败；必须先试 `Int`、再试 `String`、再试 `Double`。
+73. **`ContainerListV2` 完全没有端口字段**。它只返回 9 个基础字段
+    （`application / containerId / createAt / imageId / imageName / name / projectName / status / version`）。
+    端口在 `ShowContainerDetailListV2` 里，好在后者一次能取全部容器，不用逐个查详情。
+74. **端口通不代表能当网页打开**。实测 16 个容器里只有 1 个（13888）返回 `200 + text/html`；
+    `mc:25565` 是 Minecraft 纯 TCP 协议，塞进 WebView 只会白屏。
+    打开前必须探测，且要能区分「端口不通」和「端口通但不是 HTTP」
+    （`URLError.cannotParseResponse` / `badServerResponse` 是后者）。
+75. **`GetContainerAccessLinkInfo` 的参数是宿主端口，不是 containerId**，
+    且返回的是**规则配置**而非现成 URL。`urlPath` 容易漏——有些应用的 UI 挂在子路径下，
+    只拼 `http://host:port/` 会得到 404。`httpsPort` 也可能和 http 端口不同。
+76. **WKWebView 不实现 JS 弹窗回调 = 页面按钮点了没反应**。
+    容器面板（青龙、qBittorrent、Halo 后台）大量用 `alert` / `confirm` / `prompt`，
+    WKWebView 默认不显示，而且 `completionHandler` 不调用会让页面**永久卡死**。
+    同理 `createWebViewWith` 不实现，`target="_blank"` 链接点了也没反应。
+    这三类（弹窗、新窗口、下载）是容器面板在 WebView 里"能看不能用"的三个主要原因。
+
