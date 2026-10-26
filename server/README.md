@@ -72,6 +72,24 @@ Authorization: Bearer <API_TOKEN>
 | GET | `/api/v1/history?metric=cpu&points=120` | **历史曲线**（内存环形缓冲，60s 一点 / 6 小时） |
 | GET | `/api/v1/history/metrics` | 可用指标清单与缓冲状态（`since` / `samples` / `last_error`） |
 
+### 用户与共享（只读）
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| GET | `/api/v1/users` | **用户列表**：UID / 用户名 / 角色 / 是否管理员 / 所属组 / 最后登录时间 |
+| GET | `/api/v1/users/{uid}` | 用户详情：共享权限、配额、应用授权 |
+| GET | `/api/v1/groups` | **用户组列表**：自定义组 + 内置组（成员、共享权限） |
+| GET | `/api/v1/shares` | 共享文件夹与权限掩码 |
+
+> 只读。创建/删除用户、改密码、改权限都是高危写操作，中间层不实现。
+
+### 网络
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| GET | `/api/v1/network/interfaces` | **网口详情**：速率 / 双工 / MTU / 瞬时速率 / 累计流量估算 |
+| GET | `/api/v1/network/interfaces/{name}` | 单网口，例如 `eth0` |
+
 ### 存储 · SMART / 测速
 
 | 方法 | 路径 | 说明 |
@@ -82,6 +100,8 @@ Authorization: Bearer <API_TOKEN>
 | GET | `/api/v1/storage/disks/{disk}/benchmark` | 查当前任务状态与进度 |
 | DELETE | `/api/v1/storage/disks/{disk}/benchmark` | 停止测速 |
 | GET | `/api/v1/storage/disks/{disk}/benchmark/history` | 历史测速记录 |
+| GET | `/api/v1/storage/health` | **存储健康汇总**：池 RAID 重建/校验进度、卷容量、inode 支持情况 |
+| GET | `/api/v1/storage/disk-sleep` | **硬盘休眠状态** + 休眠策略 + 频繁唤醒统计 |
 
 `{disk}` 用**盘名**（`sda`）、**标签**（`硬盘1`）或**序列号**均可。
 带斜杠的 `/dev/sda` 不能放进路径（会被当成多级路由），请用盘名。
@@ -91,6 +111,7 @@ Authorization: Bearer <API_TOKEN>
 | 方法 | 路径 | 说明 |
 |---|---|---|
 | GET | `/api/v1/containers` | 容器列表（含 `restarting` / cpu / mem / 端口映射） |
+| GET | `/api/v1/containers/baseline` | **容器「期望运行」基线**（连续 N 轮 running 的容器） |
 | GET | `/api/v1/containers/{id}/detail` | **容器详情**：环境变量 / 端口映射 / 卷 / 网络 / 资源限制（`compose` 恒为不可用） |
 | POST | `/api/v1/containers/{id}/{action}` | action = `start` / `stop` / `restart` |
 | GET | `/api/v1/containers/{id}/logs?tail=200&keyword=` | **容器日志**，已解 Docker 多路复用帧 |
@@ -126,6 +147,7 @@ Authorization: Bearer <API_TOKEN>
 |---|---|---|
 | GET | `/api/v1/processes?limit=50&sort=cpu\|mem` | 进程列表（只读，含每进程 CPU/内存） |
 | GET | `/api/v1/services` | 系统服务列表（只读） |
+| GET | `/api/v1/services/health` | **关键服务健康**：UGOS 服务 + 系统守护进程 + Docker 引擎 + 服务基线 |
 
 ### 日志 / 告警 / 推送
 
@@ -134,7 +156,7 @@ Authorization: Bearer <API_TOKEN>
 | GET | `/api/v1/logs?page=1&size=50&level=&module=&keyword=` | 系统日志分页 |
 | GET | `/api/v1/alerts` | 当前活动告警 + 摘要 |
 | GET | `/api/v1/alerts/history?limit=100` | 告警状态跳变历史 |
-| GET | `/api/v1/alerts/rules` | 当前生效的 15 条规则与阈值 |
+| GET | `/api/v1/alerts/rules` | 当前生效的 20 条规则与阈值（第三批新增的 5 条带 `available` / `reason`，标明真机能否取到数据） |
 | POST | `/api/v1/alerts/poll` | 手动触发巡检（联调），返回事件与推送成功数 |
 | POST | `/api/v1/alerts/containers/{name}/suppress?enabled=true` | 用户主动停的容器不再告警 |
 | GET | `/api/v1/push/devices` | 已注册推送设备 + 通道统计 |
@@ -248,9 +270,108 @@ storagemgr 的 bundle 里只有 `snapshot_size` 这种空间占用字段，没�
 `v1/taskmgr/processes`、`v1/taskmgr/services` 均可用，返回每项的 `consume`（CPU/内存/网络/磁盘/GPU）。
 中间层只做**只读**接入：进程/服务的 `stop`、`restart` 属高危写操作，需要二次密码校验，暂不暴露。
 
+## 用户与权限（只读）
+
+端点全部在**控制面板 `/ctlmgr`** 的入口 bundle 里（`v1/user/*`、`v1/group/*`），没有独立的用户应用。
+
+- `v1/user/list?reverse=false` → `{"list":[...]}`，字段含 `uid` / `username` / `role` / `groups[{gid,name}]` /
+  `account_type` / `is_domain` / `is_expired` / `enable_home_dir` / `dir_quota`。
+  **没有登录时间字段**，`v1/user/uid/{uid}` 也没有。
+- **最后登录时间靠审计日志反查**：`v1/log/query?keyword=<用户名>` 里，
+  Web/App 登录是 `module=login`、`operator=<用户名>`、`content="User [xxx] from [...] logged in successfully."`；
+  SSH 登录是 `module=control_panel`、`operator=system`，用户名只在正文里。
+  中间层优先取 `operator` 精确匹配，命中不到再退到正文包含，`last_login_source` 会写明来源。
+- `v1/group/list?reverse=false` 本机返回**空数组**：UGOS 只列自定义组，内置组（`admin` gid=10、
+  `users` gid=100、`docker` gid=121、`ughomeusers` gid=133）不出现在列表里，
+  但会出现在每个用户的 `groups` 字段中。中间层据此归纳出内置组，并补上成员数与组共享权限
+  （`v1/group/permission/{gid}` 对内置组有效；`v1/group/info/{gid}` 却返回 `9999 record not found`）。
+- 共享权限：`v1/user/permission/{uid}`、`v1/group/permission/{gid}`、`v1/filemgr/getShareList` 都是 `result[]`。
+  `permission_mask` 的位含义按 Unix `rwx`(4/2/1) 推断，**UGOS 没有官方文档**，响应里同时给原始掩码；
+  组权限里出现过 `-1`，语义未知，中间层不做位解析。
+- **敏感字段处理**：`otp_info.secret`、`password` 一律不返回，只给 `otp_enabled`。
+- `v1/user/authorized/{uid}` 返回应用级授权（`com.ugreen.pro.usermgr` 等），原样透出。
+- 写操作（`user/create`、`user/delete`、`user/edit`、`user/permission/{uid}` 等）**未实现**。
+
+## 磁盘休眠与频繁唤醒
+
+- **休眠状态唯一来源是磁盘列表的 `is_standby`**（布尔）：`v2/storage/disk/list` 的每块盘都有；
+  实测本机两块盘 `is_standby=false`、`status=1`、温度正常上报。
+- 直连查询接口**不存在**：`v1/storage/disk/sleep`、`/standby`、`/hibernate`、`/power`、`/power/state`、
+  `/status` 全部 `9404`；`v1/power/*` 是 404。只有 `v1/taskmgr/stat/disk` 这类聚合里有 `status`。
+- 休眠策略在 `v1/hardware/power/config`：`hard_drive_flag`（是否启用）、`hard_drive_unit` + `hard_drive_time`
+  （空闲时长，本机 `M` / 20，即 20 分钟）、`hard_drive_strategy`、`hard_drive_target_info`（按池/按盘）、
+  `usb_hard_drive_*`、`enable_hard_drive_sleep_log`。接口同时被用来读开机计划（`time_switches`）。
+- **中间层自己不会把盘弄醒**：巡检读 SMART 时跳过 `is_standby=true` 的盘（读 SMART 需要盘转起来，
+  否则休眠策略会被监控程序自身破坏）。代价是休眠期间 SMART 数据停在旧值。
+- 状态枚举 `active` / `sleeping`；`standby` 无法与 `sleeping` 区分（ATA 层两种状态 UGOS 只暴露一个布尔），
+  因此不编造第三个值。
+- 频繁唤醒判定：`DiskSleepMonitor` 按巡检采样记录「睡 → 醒」跳变，窗口（默认 3600s）内达到阈值
+  （默认 6 次）即告警。**采样粒度 = 巡检间隔**，两次采样之间的短时唤醒会漏计。
+- 历史曲线：`/history?metric=disk_sleep` 按盘输出 1（休眠）/0（工作）的台阶序列。
+- **实测未观察到休眠**：2026-10-26 08:18–08:43 连续 13 轮采样（120s/轮，跨 24 分钟，已越过策略的
+  「空闲 20 分钟」阈值），两块盘 `is_standby` 恒为 `false`。原因是机器上常驻 9 个容器
+  （qBittorrent / Lucky / 青龙 / Minecraft 等）持续产生磁盘 IO，空闲计时不断被打断。
+  → 真实的「睡→醒」跳变在本环境无法自然复现，跳变计数与告警用合成数据验证
+  （`scripts/test_alerts_batch3.py` 第 5 组）；状态字段本身的解析走的是真实接口。
+
+## 容器「应有状态」
+
+社区反馈「系统升级后容器自动重启失败」。原规则 `container_down` 只能发现「跑着跑着停了」，
+且对每个容器都报，容易被重启循环刷屏。现在分三条、互斥：
+
+1. `container_restart_loop`：窗口内停→起 ≥3 次，或处于 Docker 重启退避（`restarting=true`）
+2. `container_expected_down`：连续 3 轮巡检 `running` → 打上「期望运行」标记；
+   之后连续 2 轮观察到停止，且未 `suppress`、未命中重启循环，才告警
+3. `container_down`：**没有**建立期望基线的容器（刚部署不到 3 轮就挂）走这条
+
+- 基线一旦建立就保持：容器恢复运行后仍期望它继续跑；容器从列表消失（被删除）才清理基线。
+- `suppress` 语义复用原有机制：`POST /alerts/containers/{name}/suppress?enabled=true` 后，
+  用户主动停的容器三条规则都不发；主动停止也会把已存在的 `container_expected_down` 清掉。
+- 基线可查：`GET /api/v1/containers/baseline` 返回每个容器的 `expected_running` / `confirmed_at` /
+  `run_streak` / `suppressed`，排查误报用。
+
+## 系统服务健康
+
+- `v1/taskmgr/services` **只有 UGOS 应用级服务**（本机 28 项：`docker_serv`、`storage_serv`、`filemgr_serv`…），
+  **没有 smbd / nfsd / sshd**。
+- 系统守护进程只能从 `v1/taskmgr/processes` 的进程名判断（本机一次返回 343 条、不分页）：
+  `dockerd`、`containerd`、`smbd`、`smbd-notifyd`、`sshd`、`nginx`、`avahi-daemon` 在跑；
+  `nfsd`、`rpc.mountd`、`rpc.statd`、`wsdd` 不存在（NFS/WS-D 未启用）。
+- 中间层关注的 11 个进程见 `HealthService.SYSTEM_WATCH`；Docker 引擎另有绝对判定
+  （`v1/docker/view/GetEngineStatus` → `{"result":"online"}`）。
+- 告警不按「不在清单里就报」：那样 NFS 没开就会一直误报。改为**基线型**（连续 3 轮存在后消失才报），
+  需要强制常驻的进程用 `ALERT_REQUIRED_SERVICES=sshd,smbd` 显式点名（缺失即 critical）。
+
+## 网络接口
+
+- 两个数据源取并集：
+  `v1/sysinfo/machine/common` → `hardware.net`（**只含已连通**网口，字段 `model`=网口名、`ip`、`mac`、
+  `speed`、`duplex`、`mtu`、`mask`）+ `v1/taskmgr/stat/net`（含未连通网口，`series[{name,label,send_rate,recv_rate}]`）。
+  本机并集结果是 `eth0`(LAN1, 1000Mbps/full/MTU1500) + `eth1`(LAN2, 未连接)。
+- **错误包 / 丢弃包 / 累计流量 UGOS 不暴露**：`v1/network/*` 下除 `ipv6/nominate` 外全部 `9404`，
+  `v1/sysinfo/network`、`v1/sysinfo/machine/net`、`v1/netif/list` 都是 404。
+  响应里 `counters.supported=false` + `probed[]` 列出试过的路径，字段留 `null` 不编数。
+- 累计流量给的是**估算值** `traffic_estimate`：用本进程记录的速率采样做梯形积分，
+  `method="rate_trapezoid"`、起点是缓冲区最早采样点，不是 NAS 侧计数。
+- 降速规则 `nic_speed` 保持原样（历史峰值 / `ALERT_NIC_MIN_MBPS`），与新增的 `nic_errors` 不重叠。
+
+## 存储健康
+
+- 池级进度都在 `v1/storage/pool/list` 的条目里，不需要额外接口：
+  - `data_scrub`：`status==1` 表示正在数据校验（前端 `isOrganizeNow`）、`process` 进度、`need_time`、
+    `time_remaining`、`last_time`、`next_start_time`、`is_cron`+`scheduled`。**只有 raid5/raid6 支持**，
+    本机 RAID0 因此 `scrub.supported=false`。
+  - `sys_sync_progress`：RAID 重建/同步进度（本机恒 0，字段语义按名称推断，未观测到真实重建）。
+  - `trim`、`spare`、`is_sync_delay` 一并透出。
+- 卷级：容量、`lazy_init_info`、`balance_info`、`space_alert_percent`、`warn_flags`。
+- **inode 拿不到**：`volume/list`、`POST volume/describe`（要 `device`，返回 `{}`）、
+  `GET volume/setting`（只有 `capacity_notify`）、`storage/overview` 都没有 inode 字段；
+  `volume/describe` 用 GET 是 `9404`、用 `name` 是 `9999 no device`。
+  所以 `volumes[].inode.supported=false` + `reason`，`volume_inode` 规则逻辑保留但不会触发。
+
 ---
 
-## 告警规则（15 条）
+## 告警规则（20 条）
 
 | # | 规则 key | 级别 | 默认阈值 | 类型 |
 |---|---|---|---|---|
@@ -266,11 +387,17 @@ storagemgr 的 bundle 里只有 `snapshot_size` 这种空间占用字段，没�
 | 10 | `mem_used` | warning | ≥92% | 绝对 |
 | 11 | `fan_stall` | warning | 状态=启用且转速 <100 RPM | 绝对 |
 | 12 | `ups_on_battery` | critical | 市电中断 | 绝对 |
-| 13 | `container_down` | warning | 连续 2 轮观察到非运行 | 跳变 |
+| 13 | `container_down` | warning | 连续 2 轮观察到非运行（**未**建基线的容器） | 跳变 |
 | 14 | `container_restart_loop` | warning | 10 分钟内重启 ≥3 次，或处于重启退避 | 跳变 |
 | 15 | `nic_speed` | warning | 低于历史峰值，或低于 `ALERT_NIC_MIN_MBPS` | 跳变 |
+| 16 | `container_expected_down` | warning | 连续 3 轮 running 建基线 → 连续 2 轮停止 | 基线 |
+| 17 | `disk_wake_freq` | warning | 1 小时内唤醒 ≥6 次 | 跳变（滑动窗口计数） |
+| 18 | `service_down` | warning / critical | 连续 3 轮存在后消失；`ALERT_REQUIRED_SERVICES` 点名缺失直接 critical | 基线 + 绝对 |
+| 19 | `volume_inode` | warning | ≥90%（≥95 升 critical） | 绝对（**当前无数据源，不触发**） |
+| 20 | `nic_errors` | warning | 10 分钟内错误包增量 ≥100 | 跳变（**当前无数据源，不触发**） |
 
-阈值全部在 `.env` 里可调。
+阈值全部在 `.env` 里可调。`GET /api/v1/alerts/rules` 会带 `available` 与 `reason`，
+第 19、20 条因 UGOS 未暴露对应字段标为 `available:false`（规则代码保留，字段出现即生效）。
 
 **状态机语义**
 
@@ -278,8 +405,14 @@ storagemgr 的 bundle 里只有 `snapshot_size` 这种空间占用字段，没�
 - **绝对型规则**首轮即按真实值判定（磁盘 60°C 就是 60°C，没有「基线」可言）。
 - **跳变型规则**首轮只建基线：网口峰值速率、容器运行状态、重启次数都要有上一轮样本才有意义，
   否则服务重启时会把一堆历史状态当成新故障。
+- **基线型规则**（第 16、18 条）同样首轮只建基线：容器要连续 3 轮 running、服务要连续 3 轮存在，
+  才标记为「期望运行 / 期望在跑」；标记后消失才告警，所以重启中间层不会把历史状态当新故障。
+- **滑动窗口型规则**（第 17 条）首轮只采样不计数：休眠状态要有上一轮样本才能判「醒来」，
+  否则服务启动时会把所有休眠盘当成刚被唤醒。
 - `container_down` 需要连续两轮确认，避免「重启循环里恰好被采样到停止」刷屏；
   启动前就已停止的容器不会计入（只在实际发生 running→stopped 跳变时开始计数）。
+- 容器三条规则互斥：命中 `container_restart_loop` 时不再发停止类告警；
+  建立基线的容器只发 `container_expected_down`，不再发 `container_down`。
 
 **风扇规则的两个实测细节**
 

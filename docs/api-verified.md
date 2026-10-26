@@ -115,7 +115,7 @@ X-CurPass-Token: <RSA 加密后的账号密码>
 | 1300 | 没有权限访问（快照数据域，本机对任意 path 均如此） |
 | 1301 | 不允许访问（`filemgr/getDirFileList` 参数不完整时常见） |
 | 2052 | 镜像名含非法字符（`DownloadImage` 字段名不对时也报这个） |
-| 5001 | 硬盘不存在（SMART/测速的 `disk` 参数值不对） |
+| 5001 | 硬盘不存在（SMART/测速的 `disk` 参数值不对）；也用于**存储池不存在**（`pool/describe` 等参数名不对时） |
 | 9404 | **模块内路由不存在**（storage 等模块的兜底码，见踩坑 19） |
 | 9405 | 接口存在但**请求方法不对**（镜像模块只吃 POST，用 GET 即此码） |
 | 32003 | 快照文件夹不存在 |
@@ -286,6 +286,100 @@ X-CurPass-Token: <RSA 加密后的账号密码>
 | GET | `v1/filemgr/getHomeFolderSet` | 家目录配置 |
 | — | `v2/filemgr/getDirFileListV2` / `getRootDirs` / `rename` | v2 新接口（1.19.1 存在） |
 
+### 用户与用户组（控制面板 `/ctlmgr`，2026-10-26 实测）
+
+> 没有独立的「用户管理」应用，端点全在 `/ctlmgr` 入口 bundle 里。
+> `api-version: 2` 请求头对下面这些接口**没有影响**（带不带结果一致），前端才需要它。
+
+| 方法 | 路径 | 参数 | 返回要点 |
+|---|---|---|---|
+| GET | `v1/user/list` | `reverse=false` | `{"list":[{uid,username,role,groups[{gid,name}],account_type,is_domain,is_expired,expire_time,enable_home_dir,dir_quota,otp_info{...}}]}` |
+| GET | `v1/user/uid/{uid}` | — | 单用户，字段同上（**没有**登录时间） |
+| GET | `v1/user/permission/{uid}` | — | `{"result":[{id,name,path,type,permission,permission_mask,time_backup}]}`；`permission` 实测为 `-1`，真实掩码看 `permission_mask`（7） |
+| GET | `v1/user/authorized/{uid}` | — | `{"result":[{id:"com.ugreen.pro.usermgr", allow:false}]}` 应用级授权 |
+| GET | `v1/user/quota/{uid}` | — | `{home:{path,used,soft,hard,file_system,max_value}, ext4:[{path,label,user,used,sub:[...]}], btrfs:[]}` |
+| GET | `v2/user/directory/quota` | — | 当前用户的家目录配额（`home_dir` / `max_value` / `has_user_quota`） |
+| GET | `v1/user/config/global` | — | 全局密码策略（`min_length` / `must_contain_case` / `disable_common_pwd`…） |
+| GET | `v1/user/config/password` | — | 密码有效期策略（`max_days` / `warn_age` / `force_change` / 白名单） |
+| GET | `v1/user/passwd/lastChangeTime/{uid}` | — | `{"result":<Unix 秒>}` 最后一次改密时间 |
+| GET | `v1/user/invite/state/{uid}` | — | `{"result":"<邀请码>"}` |
+| GET | `v1/user/headpic/list` | — | 可选头像文件名数组 |
+| GET | `v1/user/priority_link` | — | DDNS / uglink / 端口信息（含内网 IP，注意脱敏） |
+| GET | `v1/group/list` | `reverse=false` | `{"list":[]}` —— **只列自定义组**，内置组不出现 |
+| GET | `v1/group/permission/{gid}` | — | 组共享权限 `{"result":[...]}`；`permission_mask` 可为 `-1` |
+| GET | `v1/group/authorized/{gid}` | — | `{"result":null}`（本机） |
+| POST | `v2/user/permission` | `{"uids":[1003]}` 或 `{"uid":1003}` | `{data:[{email,icon_type,icon_value,name,id,folder_list[{id,name,path,type,permission,permission_mask}]}],total,cur_page}` |
+| POST | `v2/group/permission` | `{"gids":[10]}` | `{data:[],total:0,cur_page:0}`（内置组无自定义权限记录） |
+| GET | `v1/filemgr/getShareList` | — | 共享文件夹：`id/type/name/path/permission_mask/filesystem/owner/is_mount/ctime/mtime` |
+| GET | `v1/user/check/quota` | — | `{"result":false}` 是否启用配额 |
+
+**实测结论**
+
+- `role` 取值实测为 `"admin"`；判断管理员同时看 `role=="admin"` 与 `groups` 里是否有 `admin`。
+- 本机内置组：`admin`(10)、`users`(100)、`docker`(121)、`ughomeusers`(133)，只出现在用户的 `groups` 里。
+- `v1/group/info/10` → `9999 record not found`；但 `v1/group/permission/10` 正常返回 3 个共享。
+- `v1/group/gids/permission` 传 `{"gids":[10]}` → `9999 group: unknown group`。
+- 写操作（`user/create|edit|delete|permission`、`group/*`、`otp/disable`）**均未验证、未实现**。
+
+### 硬盘休眠 / 电源
+
+| 方法 | 路径 | 返回要点 |
+|---|---|---|
+| GET | `v1/hardware/power/config` | **休眠策略**：`hard_drive_flag`（启用）、`hard_drive_unit`(M/H)、`hard_drive_time`(20)、`hard_drive_strategy`、`hard_drive_target_info{pools[{pool_name,disk_in_pool[{dev_name,is_selected,support_idle,not_support_reason}]}],free_disks[]}`、`usb_hard_drive_*`、`enable_hard_drive_sleep_log`；同接口还返回开机计划 `time_switches` / `power_boot` / `wake_on` |
+| GET | `v2/storage/disk/list` | 每块盘的 **`is_standby`**（布尔）就是休眠状态；另有 `is_frozen` / `is_support_ihm` / `dev_name` |
+| GET | `v1/storage/disk/runningState?disk=/dev/sda` | `status`（实测 1=工作中）、温度、`power_start_time`、`reconnect_count`、`rescan_count`、`spin_retry_count` |
+| GET | `v1/storage/disk/vars` | `{result:[{name:"sda",temperature:36},…]}` 轻量温度 |
+| GET | `v1/storage/disk/cron/list` | 磁盘检测计划（SMART/IHM），含 `next_time` 与 `disk_list` |
+| GET | `v1/storage/disk/setting/get` | `{"badblocks":1}` 仅此一项 |
+
+**不存在的路径**（全部 `9404`）：`v1/storage/disk/sleep`、`/standby`、`/hibernate`、`/power`、
+`/power/state`、`/status`。`v1/power/disk/list`、`v1/power/config` 是 **HTTP 404 非 JSON**。
+→ 没有「按需查某块盘当前是否休眠」的接口，只能读磁盘列表的 `is_standby`。
+
+**休眠实测**（2026-10-26 08:18–08:43，13 轮 × 120s）：两块盘 `is_standby` 恒 `false`，
+温度稳定 36/38°C。休眠策略为「空闲 20 分钟」，观察窗口已越过该阈值仍未休眠 —— 机器上常驻 9 个容器
+（qBittorrent / Lucky / 青龙 / Minecraft 等）持续产生磁盘 IO，空闲计时不断被打断。
+→ `is_standby=true` 的真实报文本次**未采到**，字段含义按前端逻辑与布尔语义判定；
+「睡→醒」跳变与频繁唤醒告警用合成数据验证。
+
+### 存储健康（池 / 卷）
+
+| 方法 | 路径 | 返回要点 |
+|---|---|---|
+| GET | `v1/storage/pool/list` | 每个池都带 `data_scrub`（校验）、`trim`、`spare`、`sys_sync_progress`、`is_sync_delay`、`sync_time`、成员盘 `disks[]`、`volumes[]` |
+| GET | `v1/storage/volume/list` | 卷：容量、`health`、`warn_flags`、`space_alert_percent`、`lazy_init_info`、`balance_info`、`dirty_block_flush_status`、`support_*` 能力位 |
+| POST | `v1/storage/volume/describe` | 必须传 `{"device":"/dev/mapper/ug_xxx-pool1-volume1"}`，本机返回 `{}`；传 `{"name":...}` 报 `9999 no device`；用 GET 报 `9404` |
+| GET | `v1/storage/volume/setting?device=...` | `{"description":"","capacity_notify":{"percent":0}}`；不带 device 报 `9999 device empty` |
+| GET | `v1/storage/pool/setting/get` | `{"raid_speed_limit":{"mode":0},"bitmap":{"enable":1}}` |
+| GET | `v1/storage/overview` | `{"popup_info":{"newer_popup":true}}` |
+| GET | `v1/storage/overview/widget` | `{"result":[{"type":1,"flags":[1,2]}]}` |
+
+`data_scrub` 实测字段：`pool_name/pool_label/is_cron/need_time/time_remaining/process/status/last_time/next_start_time/whether_to_clean_up/scheduled{interval,interval_unit,first_run_datetime}`。
+前端逻辑 `(data_scrub.status)==1 → isOrganizeNow`，即 **status=1 = 正在校验**，且只对 `raid5/raid6` 有意义。
+
+**inode：不存在。** `volume/list`、`volume/describe`(POST)、`volume/setting`、`storage/overview` 都没有 inode 字段。
+
+### 任务管理器 / 进程
+
+| 方法 | 路径 | 返回要点 |
+|---|---|---|
+| GET | `v1/taskmgr/services` | **只有 UGOS 应用级服务**（本机 28 项：`docker_serv`/`storage_serv`/`filemgr_serv`/`ctl_serv`…），字段 `{name,id,appid,icon_path,icon_mtime,can_be_operated,consume{...}}`；**没有** smbd/nfsd/sshd，也**没有**运行状态位（只列在跑的） |
+| GET | `v1/taskmgr/processes` | 全量进程（本机 343 条、不分页）：`{name,pid,process_status,status,consume{...}}`；`smbd`/`smbd-notifyd`/`dockerd`/`sshd`/`nginx`/`avahi-daemon` 都在这里 |
+| GET | `v1/docker/view/GetEngineStatus` | `{"result":"online"}` |
+
+### 网络
+
+| 方法 | 路径 | 返回要点 |
+|---|---|---|
+| GET | `v1/sysinfo/machine/common` | `hardware.net[]`：`{model:<网口名>, ip, mac, speed(Mbps), duplex, mtu, mask}`，**只含已连通网口**（本机只有 eth0，缺 eth1） |
+| GET | `v1/taskmgr/stat/net` | `series[{time,name,label,send_rate,recv_rate}]`，`name` 含未连通网口（本机 eth0+eth1），`label`=LAN1/LAN2；**只有瞬时速率** |
+
+**不存在的路径**：`v1/network/interface/list`、`v1/network/list`、`v1/network/info`、`v1/network/status`、
+`v1/network/nic/list`、`v1/network/ethernet/list`、`v1/network/stat`、`v1/network/traffic`、
+`v1/network/lan/list`、`v1/network/bond/list`、`v1/network/config`、`v1/network/statistic` 全部 `9404`；
+`v1/sysinfo/network`、`v1/sysinfo/net`、`v1/sysinfo/machine/net`、`v1/net/list`、`v1/netif/list` 全部 **404**。
+→ **错误包 / 丢弃包 / 累计流量没有任何接口**。`v1/network/` 模块只确认存在 `ipv6/nominate`。
+
 ---
 
 ## 三、应用清单与 SPA 入口
@@ -363,6 +457,56 @@ GET https://<ip>:9443<entry>/js/*.js     → 正则提取 "v\d+/模块/动作"
     UGOS 前端把 `value` 拼错成了 `price`，实测确实如此。
 29. **`GetContainerById` 没有 compose 内容**。docker 应用 87 个端点里没有任何 compose/project/yaml 读取接口，
     只有 `projectName` 字段。compose 文件以普通文件存在 NAS 磁盘上。
+
+---
+
+## 四之二、第三批踩坑（用户 / 休眠 / 服务 / 网络 / 存储健康）
+
+30. **用户接口没有登录时间**。`v1/user/list`、`v1/user/uid/{uid}` 都没有 last_login 类字段；
+    `v1/user/login/record`、`v1/user/last/online`、`v1/user/online/list`、`v1/user/session/list`
+    等猜测路径全是 `9404`。唯一可行的是**反查审计日志**：`v1/log/query?keyword=<用户名>`。
+    Web/App 登录形态 `module=login` / `operator=<用户名>` / `content="User [x] from [ip] logged in successfully."`；
+    SSH 登录形态 `module=control_panel` / `operator=system` / `content="User <用户名> logged into the system via SSH."`
+    —— 这时用户名只在正文里，只按 operator 匹配会漏。
+31. **`v1/log/query` 的列表字段叫 `log_list`**，不是 `list`/`result`/`data`。按后三种键解析会得到空列表，
+    表现为「日志明明有记录但判断成没有」。
+32. **`v1/group/list` 只列自定义组**：本机返回 `{"list":[]}`，而内置 `admin`(10)/`users`(100)/`docker`(121)/
+    `ughomeusers`(133) 只出现在用户的 `groups` 字段里。`v1/group/info/10` 报 `9999 record not found`，
+    但 `v1/group/permission/10` 正常返回共享权限。→ 组列表要「自定义组 ∪ 用户 groups 归纳」。
+33. **权限掩码有两个字段且不一致**：`v1/user/permission/{uid}` 里 `permission=-1`、`permission_mask=7`；
+    `v2/user/permission` 里 `permission=7`。组权限里还出现过 `permission_mask=-1`。
+    → 只信 `permission_mask`，且负值不要按位解析。
+34. **`otp_info` 里的 `secret` 是敏感字段**，用户列表接口会原样返回。中间层必须过滤，
+    只暴露是否启用（`status` 0=未启用，实测本机无需 OTP 即可登录）。
+35. **硬盘休眠没有专用查询接口**：`v1/storage/disk/{sleep,standby,hibernate,power,status}` 全部 `9404`，
+    `v1/power/*` 是 404。唯一信号是 `v2/storage/disk/list` 的 **`is_standby`**（布尔）。
+    休眠策略在 `v1/hardware/power/config`（`hard_drive_flag`/`unit`/`time`/`target_info`）。
+    → 只能给 active / sleeping 两态；ATA 层的 standby 与 sleep 无法区分，别编第三个值。
+36. **读 SMART 会把休眠盘唤醒**。中间层巡检原本每轮读全部盘的 SMART，等于自己破坏用户的休眠策略。
+    现在对 `is_standby=true` 的盘跳过 SMART，代价是休眠期间 SMART 数据停在旧值。
+    → 任何「轮询式」监控接 UGOS 都要注意这条：读盘就会让盘转起来。
+37. **`v1/taskmgr/services` 不是 systemd 服务列表**，只是 UGOS 应用清单（本机 28 项），
+    没有 smbd / nfsd / sshd，也没有运行状态字段（只列在跑的）。
+    系统守护进程只能从 `v1/taskmgr/processes`（本机 343 条、不分页）的 `name` 里找。
+38. **`hardware.net` 只含已连通网口**：本机是双 2.5G 机型、两个网口，但 `hardware.net` 只有 `eth0`；
+    `eth1` 只在 `v1/taskmgr/stat/net` 的 series 里出现（`send_rate/recv_rate` 恒 0，`label=LAN2`）。
+    要列全部网口得把两个来源取并集，未连通口的 `connected` 只能给 `null`（不知道是没插线还是禁用）。
+39. **网口错误包 / 丢弃包 / 累计流量完全拿不到**：`v1/network/` 模块除 `ipv6/nominate` 外全 `9404`，
+    `v1/sysinfo/network` 一类是 404。只在接口里明确 `counters.supported=false`，
+    累计流量只能用中间层自己的速率采样积分估算，并标 `method=rate_trapezoid`。
+40. **inode 不存在**：`volume/list` 无 inode 字段；`volume/describe` 是 **POST + `device` 参数**
+    （GET 报 `9404`、传 `name` 报 `9999 no device`、正确传 device 返回 `{}`）；
+    `volume/setting` 只有 `capacity_notify`；`storage/overview` 只有弹窗标记。
+    → inode 告警只能保留逻辑、标不支持，不能自造数据。
+41. **`storage/pool/{describe,capacity,extendInfo}` 一直 `5001 存储池不存在`**：
+    试过 `pool` / `name` / `poolname` / `id` / `pool_name` 五种参数名，都会报 5001。
+    池级健康数据（校验、同步、trim、spare）其实**都在 `pool/list` 的条目里**，不必再调这些接口。
+42. **`data_scrub.status == 1` 才是「校验中」**，来自前端 `isOrganizeNow` 逻辑；
+    `process` 是百分比，`need_time`/`time_remaining` 单位未确认。且只有 raid5/raid6 会跑校验，
+    RAID0/RAID1 上这些字段恒 0/`"--"`。
+43. **`v1/taskmgr/stat/net` 和 `stat/disk` 的 `series` 里混着一条 `name="overview"` 的汇总项**，
+    按 name 建索引时记得排除，否则会多出一个假网口/假磁盘。
+
 
 ---
 

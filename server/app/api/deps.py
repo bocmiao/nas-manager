@@ -6,11 +6,14 @@ from fastapi import Request
 from ..security import verify_token
 from ..services.alerts import AlertEngine
 from ..services.benchmark import BenchmarkManager
+from ..services.health import HealthService
 from ..services.history import HistoryRecorder
 from ..services.images import ImageManager
 from ..services.nas import NasService
+from ..services.power import DiskSleepMonitor
 from ..services.push import PushService
 from ..services.snapshots import SnapshotService
+from ..services.users import UserService
 
 
 def require_auth(request: Request) -> None:
@@ -43,3 +46,15 @@ def get_snapshots(request: Request) -> SnapshotService:
 
 def get_history(request: Request) -> HistoryRecorder:
     return request.app.state.history
+
+
+def get_users(request: Request) -> UserService:
+    return request.app.state.users
+
+
+def get_health(request: Request) -> HealthService:
+    return request.app.state.health
+
+
+def get_sleep(request: Request) -> DiskSleepMonitor:
+    return request.app.state.disk_sleep

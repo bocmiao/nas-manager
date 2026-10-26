@@ -59,6 +59,30 @@ class Settings(BaseSettings):
     # 网口协商速率低于该值告警；0 = 只检测「相对历史峰值降速」
     alert_nic_min_mbps: int = 0
 
+    # --- 第三批告警阈值 ---
+    # 磁盘频繁唤醒：窗口内「休眠 → 工作」跳变次数达到阈值即告警
+    alert_disk_wake_window: int = 3600
+    alert_disk_wake_count: int = 6
+    # 连续 N 轮巡检都是 running 才认定容器「期望运行」
+    alert_container_expected_polls: int = 3
+    # 连续 N 轮巡检都存在的服务才认定「期望运行」
+    alert_service_expected_polls: int = 3
+    # 强制要求常驻的进程名（逗号分隔）。留空 = 只依赖基线，避免对被禁用的服务误报
+    alert_required_services: str = ""
+    # 网口错误包：窗口内增量达到该值告警（UGOS 未暴露计数时该规则自动跳过）
+    alert_nic_error_delta: int = 100
+    alert_nic_error_window: int = 600
+    # 卷 inode 使用率阈值（UGOS 未暴露 inode 时该规则自动跳过）
+    alert_volume_inode: float = 90.0
+    alert_volume_inode_critical: float = 95.0
+
+    # --- 用户 / 共享 ---
+    ttl_users: float = 60.0
+    # 最后登录时间要靠审计日志反查，单独给一个较长的缓存
+    ttl_user_login: float = 300.0
+    ttl_network: float = 15.0
+    ttl_processes: float = 30.0
+
     # --- 磁盘测速 ---
     benchmark_poll_seconds: float = 3.0
     benchmark_timeout_seconds: int = 1800

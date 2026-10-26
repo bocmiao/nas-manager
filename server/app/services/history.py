@@ -26,6 +26,8 @@ METRICS: dict[str, dict] = {
     "net_tx": {"unit": "B/s", "label": "网口发送速率"},
     "net_rx": {"unit": "B/s", "label": "网口接收速率"},
     "disk_temp": {"unit": "°C", "label": "磁盘温度", "per_disk": True},
+    # 1 = 休眠（is_standby），0 = 工作。休眠状态切换即曲线上的台阶
+    "disk_sleep": {"unit": "", "label": "磁盘休眠状态（1=休眠）", "per_disk": True},
 }
 
 
@@ -38,6 +40,7 @@ class HistoryRecorder:
             k: deque(maxlen=self._max) for k, v in METRICS.items() if not v.get("per_disk")
         }
         self._disk: dict[str, deque[tuple[int, float]]] = {}
+        self._sleep: dict[str, deque[tuple[int, float]]] = {}
         self._started_at = int(time.time())
         self._last_sample_at: int | None = None
         self._last_error: str | None = None
@@ -76,9 +79,18 @@ class HistoryRecorder:
                 temp = d.get("temperature")
                 if isinstance(temp, (int, float)):
                     series.append((ts, float(temp)))
+
+                # 休眠状态变化：is_standby 布尔 → 1/0，台阶即状态切换
+                standby = d.get("standby")
+                if isinstance(standby, bool):
+                    sleep_series = self._sleep.get(key)
+                    if sleep_series is None:
+                        sleep_series = deque(maxlen=self._max)
+                        self._sleep[key] = sleep_series
+                    sleep_series.append((ts, 1.0 if standby else 0.0))
         except Exception as exc:  # noqa: BLE001
             self._last_error = f"storage: {exc}"
-            log.warning("历史采样（磁盘温度）失败：%s", exc)
+            log.warning("历史采样（磁盘温度/休眠）失败：%s", exc)
 
         self._last_sample_at = ts
         self._samples += 1
@@ -126,8 +138,9 @@ class HistoryRecorder:
         }
 
         if meta.get("per_disk"):
+            source = self._sleep if metric == "disk_sleep" else self._disk
             if disk:
-                series = self._disk.get(disk)
+                series = source.get(disk)
                 if series is None:
                     return {**base, "disk": disk, "since": None, "points": [],
                             "reason": f"没有磁盘 {disk} 的采样（盘名/标签需与 /storage 一致）"}
@@ -137,13 +150,46 @@ class HistoryRecorder:
                 **base,
                 "disks": {
                     k: {"since": v[0][0] if v else None, "points": _window(v, points)}
-                    for k, v in self._disk.items()
+                    for k, v in source.items()
                 },
             }
 
         series = self._series[metric]
         return {**base, "since": series[0][0] if series else None,
                 "points": _window(series, points)}
+
+    def estimate_net_bytes(self) -> dict:
+        """用速率采样做梯形积分，估算「缓冲区起始以来」的网口累计流量。
+
+        UGOS 不提供累计字节数，这里不假装是真实计数：`method` 明确标注为估算，
+        且起点是缓冲区最早一个点（服务重启后清零）。
+        """
+        tx = list(self._series["net_tx"])
+        rx = list(self._series["net_rx"])
+        if len(tx) < 2 or len(rx) < 2:
+            return {
+                "supported": False,
+                "reason": "历史采样点不足 2 个，无法积分",
+                "samples": min(len(tx), len(rx)),
+            }
+
+        def _integrate(series: list[tuple[int, float]]) -> float:
+            total = 0.0
+            for (t0, v0), (t1, v1) in zip(series, series[1:]):
+                dt = max(0, t1 - t0)
+                total += (v0 + v1) / 2 * dt
+            return total
+
+        return {
+            "supported": True,
+            "rx_bytes": int(_integrate(rx)),
+            "tx_bytes": int(_integrate(tx)),
+            "since": min(tx[0][0], rx[0][0]),
+            "until": max(tx[-1][0], rx[-1][0]),
+            "samples": min(len(tx), len(rx)),
+            "method": "rate_trapezoid",
+            "note": "由本进程记录的速率采样积分估算，非 NAS 侧累计计数；起点为缓冲区最早采样点",
+        }
 
     def metrics(self) -> dict:
         return {
@@ -161,7 +207,9 @@ class HistoryRecorder:
                     "unit": v["unit"],
                     "per_disk": bool(v.get("per_disk")),
                     "count": (
-                        sum(len(s) for s in self._disk.values())
+                        sum(len(s) for s in (
+                            self._sleep if k == "disk_sleep" else self._disk
+                        ).values())
                         if v.get("per_disk")
                         else len(self._series[k])
                     ),

@@ -43,12 +43,41 @@ targets:
         CODE_SIGN_STYLE: Automatic
         SUPPORTS_MACCATALYST: "NO"
         SWIFT_STRICT_CONCURRENCY: minimal
+    dependencies:
+      # app-extension 用 embed: true 会被拷进 .app/PlugIns；写成 framework 会构建失败
+      - target: NasManagerWidget
+        embed: true
+
+  NasManagerWidget:
+    type: app-extension
+    platform: iOS
+    sources:
+      - path: NasManagerWidget
+      # 与主 App 共用的快照读写代码，同一个文件加进两个 target
+      - path: NasManager/Core/WidgetBridge.swift
+    info:
+      path: NasManagerWidget/Info.plist
+      properties:
+        CFBundleDisplayName: NAS
+        CFBundlePackageType: XPC!
+        CFBundleShortVersionString: $(MARKETING_VERSION)
+        CFBundleVersion: $(CURRENT_PROJECT_VERSION)
+        NSExtension:
+          # WidgetKit 扩展不需要 NSExtensionPrincipalClass，@main 由 WidgetBundle 提供
+          NSExtensionPointIdentifier: com.apple.widgetkit-extension
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: dev.nasmanager.app.widget
+        TARGETED_DEVICE_FAMILY: "1"
+        SKIP_INSTALL: YES
+        SWIFT_STRICT_CONCURRENCY: minimal
 
 schemes:
   NasManager:
     build:
       targets:
         NasManager: all
+        NasManagerWidget: all
     run:
       config: Debug
     archive:

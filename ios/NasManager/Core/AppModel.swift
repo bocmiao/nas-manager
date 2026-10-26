@@ -1,5 +1,6 @@
 import Foundation
 import Observation
+import WidgetKit
 
 // MARK: - 持久化键
 
@@ -193,6 +194,10 @@ final class AppModel {
         lastFirmwareCheck = Date.distantPast
         consecutiveFailures = 0
         evaluator = AlertEvaluator()
+
+        // 断开后清空快照，Widget 回到占位态而不是继续展示旧设备的数字
+        WidgetBridge.clear()
+        WidgetCenter.shared.reloadAllTimelines()
     }
 
     // MARK: 数据刷新
@@ -249,7 +254,48 @@ final class AppModel {
             metrics.record(live: live)
         }
         processAlerts(result)
+        publishWidgetSnapshot(result, updatedAt: lastUpdated ?? Date())
         await loadFirmwareIfNeeded()
+    }
+
+    /// 组装主屏小组件快照。取不到的字段留 nil，Widget 侧显示「—」，不用 0 冒充。
+    @MainActor
+    private func publishWidgetSnapshot(_ dashboard: Dashboard, updatedAt: Date) {
+        let live = dashboard.live
+
+        // 内存总量由各条内存条容量相加，已用量按占比推算
+        let memoryTotal = (dashboard.machine?.hardware?.mem ?? []).compactMap(\.size).reduce(0, +)
+        let memPercent = live?.memUsage
+        var memoryUsed: UInt64?
+        if memoryTotal > 0, let percent = memPercent {
+            memoryUsed = UInt64(Double(memoryTotal) * min(max(percent, 0), 100) / 100)
+        }
+
+        // 多个存储池合并成一个总占用率
+        let poolTotal = dashboard.pools.compactMap(\.total).reduce(0, +)
+        let poolUsed = dashboard.pools.compactMap(\.used).reduce(0, +)
+        let poolPercent = poolTotal > 0 ? Double(poolUsed) / Double(poolTotal) * 100 : nil
+
+        // 容器列表拉取失败时也是空数组，此时不写 0，避免显示「0 个容器」
+        let hasContainers = !dashboard.containers.isEmpty
+
+        let snapshot = WidgetSnapshot(
+            cpuPercent: live?.cpuUsage,
+            memPercent: memPercent,
+            memUsed: memoryUsed,
+            memTotal: memoryTotal > 0 ? memoryTotal : nil,
+            cpuTemp: live?.cpuTemp,
+            fanRpm: live?.cpuFanSpeed ?? live?.deviceFanSpeed,
+            poolUsedPercent: poolPercent,
+            runningContainers: hasContainers ? dashboard.runningContainers : nil,
+            totalContainers: hasContainers ? dashboard.containers.count : nil,
+            alertCount: alerts.unreadCount,
+            updatedAt: updatedAt,
+            machineName: dashboard.machine?.common?.nasName
+        )
+
+        WidgetBridge.write(snapshot)
+        WidgetCenter.shared.reloadAllTimelines()
     }
 
     /// 内网/公网互换：只在配了两个地址、且距上次切换超过 1 分钟时执行

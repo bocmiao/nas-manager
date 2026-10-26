@@ -20,12 +20,15 @@ from .config import get_settings
 from .security import RateLimiter
 from .services.alerts import AlertEngine
 from .services.benchmark import BenchmarkManager
+from .services.health import HealthService
 from .services.history import HistoryRecorder
 from .services.images import ImageManager
 from .services.nas import NasService
+from .services.power import DiskSleepMonitor
 from .services.push import PushService
 from .services.snapshot import gather_snapshot
 from .services.snapshots import SnapshotService
+from .services.users import UserService
 from .ugos.client import UgosAuthRequired, UgosClient, UgosError
 
 log = logging.getLogger("main")
@@ -51,12 +54,15 @@ async def lifespan(app: FastAPI):
         settings.ugos_base, settings.ugos_user, settings.ugos_password, settings.ugos_timeout
     )
     app.state.nas = NasService(app.state.client, app.state.cache, settings)
-    app.state.alerts = AlertEngine(settings)
+    app.state.disk_sleep = DiskSleepMonitor(settings)
+    app.state.alerts = AlertEngine(settings, app.state.disk_sleep)
     app.state.benchmark = BenchmarkManager(app.state.nas, settings)
     app.state.push = PushService(settings)
     app.state.images = ImageManager(app.state.nas, settings)
     app.state.snapshots = SnapshotService(app.state.nas, app.state.cache, settings)
     app.state.history = HistoryRecorder(app.state.nas, settings)
+    app.state.users = UserService(app.state.nas, app.state.cache, settings)
+    app.state.health = HealthService(app.state.nas, settings)
     app.state.ugos_reachable = False
     app.state.last_poll_ok = False
     app.state.last_poll_at = 0
@@ -87,7 +93,7 @@ async def lifespan(app: FastAPI):
     async def poller() -> None:
         while True:
             try:
-                snapshot = await gather_snapshot(app.state.nas)
+                snapshot = await gather_snapshot(app.state.nas, app.state.health)
                 events = await app.state.alerts.evaluate(snapshot)
                 app.state.ugos_reachable = True
                 app.state.last_poll_ok = True

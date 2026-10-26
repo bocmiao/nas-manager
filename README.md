@@ -131,6 +131,7 @@ python scripts/sentinel.py --host <NAS 地址> --token <中间层 token> \
 - 进程 / 服务启停接口存在但属高危写操作，本期只做只读
 - 中间层的历史采样是内存缓冲，服务重启即清空（响应里用 `since` 标明起点）
 - iOS 端依赖 iOS 17+（使用了 Observation 框架）
+- **主屏小组件依赖 App Group**。Widget 与主 App 分属两个进程，数据只能经 `group.dev.nasmanager.shared` 共享。无签名构建下拿不到该 Group（`UserDefaults(suiteName:)` 会退回本地域），小组件只会显示「未获取到数据」占位，不会崩也不会显示假数值。要真正生效需在自签时给两个 target 都配置 App Group 权限，并使用包含该 Group 的 provisioning profile。
 
 ## 开发
 

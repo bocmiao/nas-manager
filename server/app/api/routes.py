@@ -7,20 +7,26 @@ from fastapi import APIRouter, Body, Depends, HTTPException, Query, Request, sta
 
 from ..services.alerts import AlertEngine
 from ..services.benchmark import BenchmarkManager, BenchmarkRejected
+from ..services.health import HealthService
 from ..services.history import HistoryRecorder
 from ..services.images import ImageManager
 from ..services.nas import NasService
+from ..services.power import DiskSleepMonitor
 from ..services.push import PushService
 from ..services.snapshot import build_overview, gather_snapshot
 from ..services.snapshots import SnapshotService
+from ..services.users import UserService
 from .deps import (
     get_alerts,
     get_benchmark,
+    get_health,
     get_history,
     get_images,
     get_nas,
     get_push,
+    get_sleep,
     get_snapshots,
+    get_users,
     require_auth,
 )
 
@@ -88,6 +94,67 @@ async def ups(nas: NasService = Depends(get_nas)):
     return ok(await nas.ups())
 
 
+# ------------------------------------------------------------------ 用户与共享（只读）
+
+@router.get("/users", dependencies=[Depends(require_auth)])
+async def users(svc: UserService = Depends(get_users)):
+    """用户列表：UID / 角色 / 是否管理员 / 所属组 / 最后登录时间。
+
+    只读。最后登录时间由审计日志 `module=login` 反查（用户接口本身不返回登录时间）。
+    """
+    return ok(await svc.users())
+
+
+@router.get("/users/{uid}", dependencies=[Depends(require_auth)])
+async def user_detail(uid: int, svc: UserService = Depends(get_users)):
+    """单个用户详情：共享权限、配额、应用授权。"""
+    try:
+        return ok(await svc.detail(uid))
+    except ValueError as exc:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+
+
+@router.get("/groups", dependencies=[Depends(require_auth)])
+async def groups(svc: UserService = Depends(get_users)):
+    """用户组列表：自定义组 + 从用户归纳出的内置组（含成员的共享权限）。"""
+    return ok(await svc.groups())
+
+
+@router.get("/shares", dependencies=[Depends(require_auth)])
+async def shares(svc: UserService = Depends(get_users)):
+    """共享文件夹与权限掩码。"""
+    return ok(await svc.shares())
+
+
+# ------------------------------------------------------------------ 网络
+
+@router.get("/network/interfaces", dependencies=[Depends(require_auth)])
+async def network_interfaces(
+    health: HealthService = Depends(get_health),
+    hist: HistoryRecorder = Depends(get_history),
+):
+    """网口详情：协商速率 / 双工 / MTU / 瞬时速率 / 累计流量估算。
+
+    UGOS 不暴露错误包、丢弃包与累计流量，`counters.supported=false` 会说明原因；
+    `traffic_estimate` 是中间层按自己采样积分出来的估算值，不是 NAS 计数。
+    """
+    return ok(await health.network(hist))
+
+
+@router.get("/network/interfaces/{name}", dependencies=[Depends(require_auth)])
+async def network_interface(
+    name: str,
+    health: HealthService = Depends(get_health),
+    hist: HistoryRecorder = Depends(get_history),
+):
+    data = await health.network(hist)
+    port = next((p for p in data.get("ports") or [] if p.get("name") == name), None)
+    if port is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, detail=f"没有网口 {name}")
+    return ok({**port, "traffic_estimate": data.get("traffic_estimate"),
+               "counters": data.get("counters")})
+
+
 # ------------------------------------------------------------------ 历史曲线
 
 @router.get("/history", dependencies=[Depends(require_auth)])
@@ -122,6 +189,39 @@ async def overview(nas: NasService = Depends(get_nas), alerts: AlertEngine = Dep
 @router.get("/storage", dependencies=[Depends(require_auth)])
 async def storage(nas: NasService = Depends(get_nas)):
     return ok(await nas.storage())
+
+
+@router.get("/storage/health", dependencies=[Depends(require_auth)])
+async def storage_health(health: HealthService = Depends(get_health)):
+    """存储健康汇总：池 RAID 重建/校验进度、卷容量与 inode 支持情况。
+
+    inode 在 UGOS 上拿不到，`volumes[].inode.supported=false` + `reason` 说明试过哪些接口。
+    """
+    return ok(await health.storage())
+
+
+@router.get("/storage/disk-sleep", dependencies=[Depends(require_auth)])
+async def disk_sleep(
+    nas: NasService = Depends(get_nas),
+    sleep: DiskSleepMonitor = Depends(get_sleep),
+    alerts: AlertEngine = Depends(get_alerts),
+):
+    """硬盘休眠状态与频繁唤醒统计。
+
+    状态唯一来源是磁盘列表的 `is_standby`（active / sleeping）；
+    唤醒次数由中间层按巡检采样累计，采样间隔内「睡下又醒来」会漏计。
+    """
+    disks = await nas.disk_sleep_states()
+    try:
+        policy = await nas.disk_sleep_policy()
+    except Exception:  # noqa: BLE001 - 策略接口不可用不影响状态
+        policy = {}
+    sleep.observe(disks, time.time())
+    data = sleep.status(disks, policy)
+    data["alerts"] = [
+        a.to_dict() for a in alerts.active() if a.key.startswith("disk_wake_freq:")
+    ]
+    return ok(data)
 
 
 # ------------------------------------------------------------------ 磁盘 SMART / 测速
@@ -232,9 +332,20 @@ async def container_action(
     return ok(result)
 
 
+@router.get("/containers/baseline", dependencies=[Depends(require_auth)])
+async def containers_baseline(alerts: AlertEngine = Depends(get_alerts)):
+    """容器「期望运行」基线。
+
+    连续 `ALERT_CONTAINER_EXPECTED_POLLS`（默认 3）轮巡检都是 running 的容器
+    会被标记为期望运行；之后停止且未被 `suppress` 时产生 `container_expected_down`。
+    """
+    return ok(alerts.container_baseline())
+
+
 @router.get("/containers/{container_id}/logs", dependencies=[Depends(require_auth)])
 async def container_logs(
     container_id: str,
+
     tail: int = Query(200, ge=1, le=5000),
     keyword: str = "",
     nas: NasService = Depends(get_nas),
@@ -449,6 +560,21 @@ async def services(nas: NasService = Depends(get_nas)):
     return ok(await nas.services())
 
 
+@router.get("/services/health", dependencies=[Depends(require_auth)])
+async def services_health(
+    health: HealthService = Depends(get_health),
+    alerts: AlertEngine = Depends(get_alerts),
+):
+    """关键服务健康：UGOS 应用服务 + 系统守护进程 + Docker 引擎。
+
+    `taskmgr/services` 只有 UGOS 应用级服务（无 smbd / nfsd），
+    系统守护进程从 `taskmgr/processes` 的进程名判断。
+    """
+    data = await health.services()
+    data["baseline"] = alerts.service_baseline()
+    return ok(data)
+
+
 @router.get("/alerts", dependencies=[Depends(require_auth)])
 async def alerts_list(alerts: AlertEngine = Depends(get_alerts)):
     return ok(
@@ -479,9 +605,10 @@ async def suppress_container(
 
 @router.post("/alerts/poll", dependencies=[Depends(require_auth)])
 async def poll_now(alerts: AlertEngine = Depends(get_alerts), nas: NasService = Depends(get_nas),
-                   push: PushService = Depends(get_push)):
+                   push: PushService = Depends(get_push),
+                   health: HealthService = Depends(get_health)):
     """手动触发一次巡检，便于联调。"""
-    snapshot = await gather_snapshot(nas)
+    snapshot = await gather_snapshot(nas, health)
     events = await alerts.evaluate(snapshot)
     pushed = 0
     for ev in events:
@@ -491,6 +618,7 @@ async def poll_now(alerts: AlertEngine = Depends(get_alerts), nas: NasService = 
             "events": [e.to_dict() for e in events],
             "summary": alerts.summary(),
             "pushed": pushed,
+            "degraded": snapshot.get("degraded") or [],
         }
     )
 
@@ -521,11 +649,37 @@ async def alert_rules(request: Request, alerts: AlertEngine = Depends(get_alerts
                 {"key": "mem_used", "level": "warning", "threshold": s.alert_mem_used, "unit": "%"},
                 {"key": "fan_stall", "level": "warning", "threshold": s.alert_fan_min_rpm, "unit": "RPM"},
                 {"key": "ups_on_battery", "level": "critical", "threshold": None},
-                {"key": "container_down", "level": "warning", "threshold": "连续 2 轮非运行"},
+                {"key": "container_down", "level": "warning", "threshold": "连续 2 轮非运行",
+                 "note": "仅对未建立期望基线的容器生效，与 container_expected_down 互斥"},
                 {"key": "container_restart_loop", "level": "warning",
                  "threshold": f"{s.alert_container_restart_count} 次 / {s.alert_container_restart_window}s"},
                 {"key": "nic_speed", "level": "warning",
                  "threshold": s.alert_nic_min_mbps or "低于历史峰值", "unit": "Mbps"},
+                # --- 第三批 ---
+                {"key": "container_expected_down", "level": "warning",
+                 "threshold": f"连续 {s.alert_container_expected_polls} 轮 running 后转为停止",
+                 "available": True,
+                 "note": "命中 container_restart_loop 时不再发本条"},
+                {"key": "disk_wake_freq", "level": "warning",
+                 "threshold": s.alert_disk_wake_count,
+                 "window_seconds": s.alert_disk_wake_window,
+                 "unit": "次/窗口", "available": True,
+                 "note": "计数由巡检采样累计，采样间隔内的短时唤醒会漏计"},
+                {"key": "service_down", "level": "warning",
+                 "threshold": f"连续 {s.alert_service_expected_polls} 轮存在后消失",
+                 "available": True,
+                 "note": "ALERT_REQUIRED_SERVICES 里点名的进程缺失会直接 critical"},
+                {"key": "volume_inode", "level": "warning",
+                 "threshold": s.alert_volume_inode,
+                 "critical_at": s.alert_volume_inode_critical,
+                 "unit": "%", "available": False,
+                 "reason": "UGOS 存储接口不返回 inode 计数（volume/list、volume/describe、"
+                           "volume/setting、storage/overview 均已验证），规则逻辑保留但不会触发"},
+                {"key": "nic_errors", "level": "warning",
+                 "threshold": s.alert_nic_error_delta,
+                 "window_seconds": s.alert_nic_error_window,
+                 "available": False,
+                 "reason": "UGOS 未暴露网口错误包/丢弃包计数，规则逻辑保留但不会触发"},
             ],
             "summary": alerts.summary(),
         }

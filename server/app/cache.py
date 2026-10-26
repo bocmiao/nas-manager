@@ -32,6 +32,10 @@ class TTLCache:
     def peek(self, key: str) -> tuple[float, Value] | None:
         return self._data.get(key)
 
+    def put(self, key: str, value: Value) -> None:
+        """直接写入（用于缓存 get_or_set 之外的派生值，例如反查出来的最后登录时间）。"""
+        self._data[key] = (time.monotonic(), value)
+
     def invalidate(self, prefix: str = "") -> None:
         for k in [k for k in self._data if k.startswith(prefix)]:
             self._data.pop(k, None)

@@ -366,6 +366,8 @@ class NasService:
             total = int(p.get("total") or 0)
             used = int(p.get("used") or 0)
             level = (p.get("level") or "").lower()
+            scrub = p.get("data_scrub") or {}
+            trim = p.get("trim") or {}
             pool_out.append(
                 {
                     "name": p.get("name"),
@@ -381,6 +383,33 @@ class NasService:
                     "no_redundancy": level in NO_REDUNDANCY_LEVELS,
                     "sync_progress": p.get("sys_sync_progress"),
                     "disks": [d.get("label") or d.get("name") for d in (p.get("disks") or [])],
+                    # 以下为存储健康汇总所需，均为原始字段 + 少量实测语义
+                    "sync": {
+                        # RAID 重建/同步进度（%）。本机 sys_sync_progress 恒 0，字段语义按名称推断
+                        "progress": p.get("sys_sync_progress"),
+                        "delayed": bool(p.get("is_sync_delay")),
+                        "sync_time": p.get("sync_time"),
+                    },
+                    "scrub": {
+                        # 实测：data_scrub.status == 1 表示正在校验（前端 isOrganizeNow）
+                        "running": scrub.get("status") == 1,
+                        "status": scrub.get("status"),
+                        "progress": scrub.get("process"),
+                        "need_time": scrub.get("need_time"),
+                        "time_remaining": scrub.get("time_remaining"),
+                        "last_time": scrub.get("last_time"),
+                        "next_start_time": scrub.get("next_start_time"),
+                        "scheduled": bool(scrub.get("is_cron")),
+                        "schedule": scrub.get("scheduled") or {},
+                        "supported": level in ("raid5", "raid6"),
+                    },
+                    "trim": {
+                        "enabled": bool(trim.get("enable")),
+                        "supported": bool(trim.get("is_support")),
+                        "next_start_time": trim.get("next_start_time"),
+                    },
+                    "spare": p.get("spare"),
+                    "volumes": [v.get("name") for v in (p.get("volumes") or []) if isinstance(v, dict)],
                 }
             )
 
@@ -403,6 +432,14 @@ class NasService:
                     "health": v.get("health"),
                     "status": v.get("status"),
                     "is_home": bool(v.get("is_home")),
+                    "space_alert_percent": v.get("space_alert_percent"),
+                    "warn_flags": v.get("warn_flags"),
+                    "lazy_init": v.get("lazy_init_info") or {},
+                    "balance": v.get("balance_info") or {},
+                    # 实测：UGOS 存储接口不返回 inode 计数，此处恒为 None，由上层标注不支持
+                    "inode_used_percent": None,
+                    "inode_total": None,
+                    "inode_free": None,
                 }
             )
 
@@ -515,11 +552,19 @@ class NasService:
         }
 
     async def all_smart(self) -> list[dict]:
-        """巡检用：批量取所有支持 SMART 的磁盘，单盘失败不影响其它。"""
+        """巡检用：批量取所有支持 SMART 的磁盘，单盘失败不影响其它。
+
+        **休眠中的盘直接跳过**：读 SMART 需要盘转起来，对 `is_standby=true` 的盘取
+        SMART 相当于由中间层自己把盘唤醒，会让用户的休眠策略彻底失效。
+        代价是休眠期间的 SMART 数据停在旧值（温度等），恢复工作后自动更新。
+        """
         disks = (await self.storage()).get("disks") or []
         out: list[dict] = []
         for d in disks:
             if not d.get("support_smart"):
+                continue
+            if d.get("standby"):
+                log.debug("%s 处于休眠，跳过 SMART 以免唤醒", d.get("name"))
                 continue
             try:
                 out.append(await self.disk_smart(d.get("name") or ""))
@@ -783,6 +828,11 @@ class NasService:
         }
 
     async def services(self) -> dict:
+        return await self._cache.get_or_set(
+            "services", self._s.ttl_network, self._fetch_services
+        )
+
+    async def _fetch_services(self) -> dict:
         raw = await self._c.get("v1/taskmgr/services") or {}
         items = [
             {
@@ -801,6 +851,155 @@ class NasService:
             "summary": raw.get("total_consume") or {},
             "items": items,
         }
+
+    async def process_names(self) -> dict[str, int]:
+        """进程名 → 实例数。
+
+        实测 `v1/taskmgr/processes` 一次返回全量（本机 339 条，不分页），
+        里面能看到 smbd / dockerd / nginx / sshd 等系统守护进程，
+        而 `services()` 只列 UGOS 应用级服务（28 条，不含 smbd / nfsd）。
+        """
+        return await self._cache.get_or_set(
+            "process_names", self._s.ttl_processes, self._fetch_process_names
+        )
+
+    async def _fetch_process_names(self) -> dict[str, int]:
+        raw = await self._c.get("v1/taskmgr/processes") or {}
+        counts: dict[str, int] = {}
+        for p in raw.get("list") or []:
+            if not isinstance(p, dict):
+                continue
+            name = (p.get("name") or "").strip()
+            if name:
+                counts[name] = counts.get(name, 0) + 1
+        return counts
+
+    async def docker_engine(self) -> dict:
+        """Docker 引擎状态。`GetEngineStatus` 返回 `{"result": "online"}`。"""
+        return await self._cache.get_or_set(
+            "docker_engine", self._s.ttl_network, self._fetch_docker_engine
+        )
+
+    async def _fetch_docker_engine(self) -> dict:
+        raw = await self._c.get("v1/docker/view/GetEngineStatus") or {}
+        status = raw.get("result") if isinstance(raw, dict) else None
+        return {"status": status or "unknown", "healthy": status == "online"}
+
+    # ------------------------------------------------------------------ 硬盘休眠
+
+    async def disk_sleep_policy(self) -> dict:
+        """硬盘休眠策略（`v1/hardware/power/config`，实测可用）。
+
+        字段语义来自字段名与前端「硬件与电源」页，未做写操作验证：
+        `hard_drive_flag` 是否启用休眠、`hard_drive_unit`(M/H) + `hard_drive_time` 空闲时长。
+        """
+        return await self._cache.get_or_set("sleep_policy", 60.0, self._fetch_sleep_policy)
+
+    async def _fetch_sleep_policy(self) -> dict:
+        raw = await self._c.get("v1/hardware/power/config") or {}
+        targets = raw.get("hard_drive_target_info") or {}
+        usb_targets = raw.get("usb_hard_drive_target_info") or {}
+
+        def _targets(info: dict) -> list[dict]:
+            out: list[dict] = []
+            for pool in info.get("pools") or []:
+                if not isinstance(pool, dict):
+                    continue
+                out.append(
+                    {
+                        "kind": "pool",
+                        "pool": pool.get("pool_name"),
+                        "label": pool.get("pool_label"),
+                        "selected": bool(pool.get("is_selected")),
+                        "disks": [
+                            {
+                                "dev": d.get("dev_name"),
+                                "label": d.get("disk_label"),
+                                "selected": bool(d.get("is_selected")),
+                                "support_idle": bool(d.get("support_idle")),
+                                "reason": d.get("not_support_reason") or "",
+                            }
+                            for d in (pool.get("disk_in_pool") or [])
+                            if isinstance(d, dict)
+                        ],
+                    }
+                )
+            for d in info.get("free_disks") or []:
+                if not isinstance(d, dict):
+                    continue
+                out.append(
+                    {
+                        "kind": "disk",
+                        "pool": None,
+                        "label": d.get("disk_label"),
+                        "selected": bool(d.get("is_selected")),
+                        "disks": [
+                            {
+                                "dev": d.get("dev_name"),
+                                "label": d.get("disk_label"),
+                                "selected": bool(d.get("is_selected")),
+                                "support_idle": bool(d.get("support_idle")),
+                                "reason": d.get("not_support_reason") or "",
+                            }
+                        ],
+                    }
+                )
+            return out
+
+        unit = raw.get("hard_drive_unit") or ""
+        minutes = None
+        if isinstance(raw.get("hard_drive_time"), (int, float)):
+            minutes = int(raw["hard_drive_time"]) * (60 if str(unit).upper().startswith("H") else 1)
+
+        return {
+            "enabled": bool(raw.get("hard_drive_flag")),
+            "unit": unit or None,
+            "raw_time": raw.get("hard_drive_time"),
+            "idle_minutes": minutes,
+            "strategy": raw.get("hard_drive_strategy"),
+            "targets": _targets(targets),
+            "scope": raw.get("hard_drive_scope") or {},
+            "usb": {
+                "enabled": bool(raw.get("usb_hard_drive_flag")),
+                "unit": raw.get("usb_hard_drive_unit"),
+                "raw_time": raw.get("usb_hard_drive_time"),
+                "targets": _targets(usb_targets),
+            },
+            "sleep_log_enabled": bool(raw.get("enable_hard_drive_sleep_log")),
+            "scheduled_power": {
+                "enabled": bool(raw.get("enable_scheduled_power")),
+                "switches": raw.get("time_switches") or [],
+            },
+        }
+
+    async def disk_sleep_states(self) -> list[dict]:
+        """每块盘的休眠状态。
+
+        唯一可信信号是磁盘列表的 `is_standby`（布尔）：
+        实测本机两块盘 `is_standby=false`、`status=1`。休眠时的 `status` 取值未观测到，
+        因此不做推断，原样透出。
+        """
+        disks = (await self.storage()).get("disks") or []
+        out: list[dict] = []
+        for d in disks:
+            standby = d.get("standby")
+            state = "unknown" if standby is None else ("sleeping" if standby else "active")
+            out.append(
+                {
+                    "name": d.get("name"),
+                    "label": d.get("label"),
+                    "slot": d.get("slot"),
+                    "state": state,
+                    "is_standby": standby,
+                    "standby": standby,
+                    "status": d.get("status"),
+                    "temperature": d.get("temperature"),
+                    "power_on_hours": d.get("power_on_hours"),
+                    "pool": d.get("used_for"),
+                    "model": d.get("model"),
+                }
+            )
+        return out
 
     # ------------------------------------------------------------------ 日志
 
