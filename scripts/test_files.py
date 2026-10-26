@@ -556,6 +556,61 @@ def test_roots() -> None:
     asyncio.run(run())
 
 
+# ---------------------------------------------------------------- 10. 复制/移动
+
+def test_transfer() -> None:
+    print("\n[10] 复制 / 移动")
+
+    async def copy():
+        s, c = svc({"v2/filemgr/cpOrMvPath": {
+            "path": "", "task_id": "uuid-1",
+        }})
+        return await s.copy_or_move(
+            ["/volume1/docker/a.txt"], "/volume1/docker/sub"
+        ), c
+
+    r, c = asyncio.run(copy())
+    check("返回 task_id", r.get("task_id") == "uuid-1", str(r))
+    body = last_body(c)
+    check("src 是字符串数组（对象数组会 9999）",
+          body.get("src") == ["/volume1/docker/a.txt"], str(body.get("src")))
+    check("dst 已传入", body.get("dst") == "/volume1/docker/sub", str(body.get("dst")))
+    check("默认 action_type=3（另存改名，不覆盖）",
+          body.get("action_type") == 3, str(body.get("action_type")))
+    check("默认 type=false（复制）", body.get("type") is False, str(body.get("type")))
+
+    async def move():
+        s, c = svc({"v2/filemgr/cpOrMvPath": {"task_id": "uuid-2"}})
+        return await s.copy_or_move(
+            ["/volume1/docker/a.txt"], "/volume1/docker/sub", move=True
+        ), c
+
+    r, c = asyncio.run(move())
+    check("move=True 时 type=true", last_body(c).get("type") is True, str(last_body(c).get("type")))
+
+    async def guard():
+        s, _ = svc({})
+        cases = [
+            ([], "/volume1/docker/sub", False, "空 src"),
+            ("/volume1/docker/a.txt", "/volume1/docker/sub", False, "src 不是数组"),
+            (["/volume1/docker/a"], "/volume1/docker/a/b", False, "移动到自己的子目录"),
+            (["/volume1/docker/a"], "/volume1/docker/a", False, "移动到自己"),
+            (["/volume1/../etc/passwd"], "/volume1/docker", False, "src 含 .."),
+            (["/volume1/docker/a"], "/volume1/../etc", False, "dst 含 .."),
+        ]
+        leaked = []
+        for src, dst, mv, why in cases:
+            try:
+                await s.copy_or_move(src, dst, move=mv)
+                leaked.append(why)
+            except FileRejected:
+                pass
+        return leaked
+
+    leaked = asyncio.run(guard())
+    check("非法入参全部本地拒绝", not leaked, str(leaked))
+
+
 def main() -> int:
     test_sanitize()
     test_list_body()
@@ -566,6 +621,7 @@ def main() -> int:
     test_download()
     test_upload()
     test_roots()
+    test_transfer()
 
     failed = [r for r in results if r[0] == FAIL]
     print("\n" + "=" * 50)

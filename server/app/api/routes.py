@@ -1175,6 +1175,31 @@ async def files_recycle_config(files: FileService = Depends(get_files)):
     return ok(await files.recycle_conf())
 
 
+@router.post("/files/transfer", dependencies=[Depends(require_auth)])
+async def files_transfer(
+    src: list[str] = Body(..., embed=True, description="要复制/移动的绝对路径数组"),
+    dst: str = Body(..., embed=True, description="目标目录绝对路径"),
+    move: bool = Body(False, embed=True, description="true=移动，false=复制"),
+    action_type: int = Body(
+        3, embed=True, description="0=跳过 1=覆盖 3=另存改名（默认）4=逐项询问"
+    ),
+    files: FileService = Depends(get_files),
+):
+    """复制 / 移动，返回 `{task_id, dst, src, move}`。
+
+    这是**异步任务**：小文件实测 0.7 秒完成，但没有公开的进度查询接口
+    （`getDelTaskInfo` 查不到这类任务，回 `1368` 或 `9999`）。
+    客户端判断完成只能轮询目标目录，别去找任务接口。
+    """
+    try:
+        result = await files.copy_or_move(
+            src, dst, move=move, action_type=action_type
+        )
+    except FileRejected as exc:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, detail=exc.msg) from exc
+    return ok(result)
+
+
 @router.post("/files/upload", dependencies=[Depends(require_auth)])
 async def files_upload(
     request: Request,

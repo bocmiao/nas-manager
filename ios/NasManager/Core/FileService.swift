@@ -350,6 +350,19 @@ struct FileDeleteResult: Decodable, Hashable {
     var forever: Bool
 }
 
+/// 复制 / 移动的结果。
+///
+/// NAS 回的是 `{path: "", task_id: "<uuid>"}` —— **异步任务**，不是同步完成。
+/// 小文件实测 0.7 秒就好，移动更快（0.1 秒），但**没有进度查询接口**：
+/// `getDelTaskInfo` 用 `task_uuid` / `task_id` 查回 `9999`，用 `uuid` 查回
+/// `1368 对象访问超时，您的任务不存在或已结束`。所以只能靠轮询目标目录确认。
+struct FileTransferResult: Hashable {
+    let taskID: String
+    let source: [String]
+    let destination: String
+    let isMove: Bool
+}
+
 /// 上传结果。NAS 只回 `data.result` 一个落盘路径，`name` / `size` 在本地补齐。
 ///
 /// 注意 `path` 可能是改名后的路径（`名字(1).后缀`），是不是原名要看 `name`。
@@ -853,6 +866,89 @@ final class FileService {
             "v2/filemgr/delPaths", json: ["paths": cleaned, "forever": forever]
         )
         return FileDeleteResult(deleted: cleaned, forever: forever)
+    }
+
+    // MARK: 复制 / 移动
+
+    /// 复制 / 移动（`POST v2/filemgr/cpOrMvPath`）。
+    ///
+    /// 实测三条硬契约：
+    /// - `src` 必须是**字符串路径数组**；传 `[{path, intranet_share_id}]` 直接 `9999`。
+    /// - `type`：`true` = 移动，`false` = 复制。
+    /// - `action_type`：0=跳过 1=覆盖 3=另存改名 4=逐项询问。默认 3，
+    ///   目标已有同名时生成 `名字(1).后缀`，既不覆盖也不丢数据。
+    ///
+    /// 返回的 `taskID` **查不到进度**（`getDelTaskInfo` 对这类任务回 `1368` / `9999`），
+    /// 所以调用方要自己轮询目标目录判断完成，见 `waitForTransfer`。
+    func copyOrMove(
+        paths: [String],
+        to destination: String,
+        move: Bool = false,
+        actionType: Int = 3
+    ) async throws -> FileTransferResult {
+        let cleaned = paths.filter { !$0.isEmpty }
+        guard !cleaned.isEmpty else { throw UgosError.auth("没有要复制/移动的条目") }
+        guard destination.hasPrefix("/") else {
+            throw UgosError.auth("目标目录必须是绝对路径")
+        }
+        // 目录不能塞进自己的子目录，否则 NAS 侧会无限递归
+        for path in cleaned where destination == path || destination.hasPrefix(path + "/") {
+            throw UgosError.auth("不能把条目复制/移动到它自己的子目录")
+        }
+
+        let payload = try await client.post(
+            "v2/filemgr/cpOrMvPath",
+            json: [
+                "dst": destination,
+                "src": cleaned,
+                "action_type": actionType,
+                "type": move,
+                "intranet_share_id": 0
+            ]
+        )
+        let taskID = FileService.text(FileService.field(payload, "task_id")) ?? ""
+        return FileTransferResult(
+            taskID: taskID, source: cleaned, destination: destination, isMove: move
+        )
+    }
+
+    /// 等任务落地：轮询目标目录，直到条目出现（复制）或从源目录消失（移动）。
+    ///
+    /// NAS 没有任务进度接口，只能靠结果推断。小文件实测 0.7 秒完成，
+    /// 这里给到 30 秒，超时就当失败——起码不会让界面一直转圈。
+    func waitForTransfer(
+        _ result: FileTransferResult,
+        attempts: Int = 30,
+        interval: TimeInterval = 1.0
+    ) async throws {
+        let probe = result.isMove
+            ? (result.source.first ?? "")
+            : result.destination
+        guard !probe.isEmpty else { return }
+        let parent = probe.contains("/")
+            ? String(probe[..<(probe.lastIndex(of: "/") ?? probe.startIndex)])
+            : probe
+
+        for _ in 0..<max(1, attempts) {
+            let listing = try? await list(
+                path: parent, page: 1, sort: .name, reverse: false
+            )
+            let names = Set((listing?.entries ?? []).map(\.name))
+            if result.isMove {
+                // 移动：源目录里都不在了就算完
+                let still = result.source.compactMap { $0.split(separator: "/").last }
+                    .map(String.init)
+                    .filter { names.contains($0) }
+                if still.isEmpty { return }
+            } else {
+                let arrived = result.source.compactMap { $0.split(separator: "/").last }
+                    .map(String.init)
+                    .filter { names.contains($0) }
+                if !arrived.isEmpty { return }
+            }
+            try? await Task.sleep(nanoseconds: UInt64(interval * 1_000_000_000))
+        }
+        throw UgosError.auth(result.isMove ? "移动还没完成，等下刷新看看" : "复制还没完成，等下刷新看看")
     }
 
     // MARK: 上传

@@ -72,6 +72,14 @@ UPLOAD_AUTO_RENAME = 3
 UPLOAD_OVERWRITE = 1
 UPLOAD_ACTION_LABELS = {0: "覆盖", 1: "覆盖", 2: "覆盖", 3: "同名自动改名"}
 
+# 复制 / 移动的同名冲突策略（实测，见 docs/api-verified.md §四之九）
+# 0=跳过 1=覆盖 3=另存(自动改名) 4=逐项询问
+# 默认 3：目标已有同名时生成 `hello(1).txt`，不覆盖也不丢数据。
+ACTION_TYPE_SKIP = 0
+ACTION_TYPE_COVER = 1
+ACTION_TYPE_SAVE = 3
+ACTION_TYPE_ASK = 4
+
 # 单次 POST 承载的字节数。NAS 侧不限制块大小（前端从 128KB 自增到 100MB），
 # 这里取 8MB：既不会让网关超时，也不会把内存吃满。
 UPLOAD_CHUNK_SIZE = 8 * 1024 * 1024
@@ -415,6 +423,55 @@ class FileService:
         if not data:
             raise FileRejected("预览返回空内容")
         return data, ctype
+
+    async def copy_or_move(
+        self,
+        src: list[str],
+        dst: str,
+        move: bool = False,
+        action_type: int = ACTION_TYPE_SAVE,
+    ) -> dict:
+        """复制 / 移动（`POST v2/filemgr/cpOrMvPath`），返回 `{path, task_id}`。
+
+        实测五个要点：
+        1. `src` 必须是**字符串路径数组**。传 `[{path, intranet_share_id}]`
+           会直接得到 `9999 操作失败!`（这点和 `delPaths` 一致）。
+        2. `type`：`true` = 移动，`false` = 复制。
+        3. `action_type`：0=跳过 1=覆盖 3=另存 4=逐项询问。
+           实测 3 在目标已有同名时生成 `hello(1).txt`、`hello(2).txt`，
+           既不覆盖也不丢数据，所以作为默认。
+        4. 返回 `{path: "", task_id: "<uuid>"}`，是**异步任务**。小文件 0.7 秒就完，
+           移动更快（0.1 秒）。
+        5. **没有公开的进度查询接口**：`getDelTaskInfo` 用 `task_uuid` / `task_id`
+           查会回 `9999 操作失败!`，用 `uuid` 查回
+           `1368 对象访问超时，您的任务不存在或已结束`。所以调用方只能轮询
+           目标目录来判断完成，别去找任务接口。
+        """
+        if not src:
+            raise FileRejected("src 不能为空")
+        if not isinstance(src, list):
+            raise FileRejected("src 必须是路径数组")
+        clean_dst = sanitize_path(dst)
+        clean_src = [sanitize_path(p) for p in src]
+        # 目录不能移动到自己的子目录里，否则会无限递归
+        for p in clean_src:
+            if clean_dst == p or clean_dst.startswith(p + "/"):
+                raise FileRejected(f"不能把 {p} 复制/移动到它自己的子目录")
+
+        body = {
+            "dst": clean_dst,
+            "src": clean_src,
+            "action_type": int(action_type),
+            "type": bool(move),
+            "intranet_share_id": 0,
+        }
+        raw = await self._c.post("v2/filemgr/cpOrMvPath", body) or {}
+        return {
+            "task_id": raw.get("task_id") or "",
+            "dst": clean_dst,
+            "src": clean_src,
+            "move": bool(move),
+        }
 
     async def recycle_conf(self) -> dict:
         """回收站开关状态（`GET v1/filemgr/getRecycleConf`）。

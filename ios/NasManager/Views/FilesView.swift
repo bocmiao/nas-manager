@@ -21,6 +21,13 @@ private struct SharedFile: Identifiable {
     let name: String
 }
 
+/// 待执行的复制 / 移动请求，选完目标目录才真正发出去
+private struct TransferRequest: Identifiable {
+    let id = UUID()
+    let paths: [String]
+    let move: Bool
+}
+
 /// 上传进度。多文件是顺序上传，这里只记「第几个 / 共几个 + 当前文件名」
 private struct FileUploadProgress {
     let index: Int
@@ -59,6 +66,8 @@ struct FilesView: View {
     @State private var actionError: String?
     @State private var shared: SharedFile?
     @State private var previewEntry: FileEntry?
+    @State private var pendingTransfer: TransferRequest?
+    @State private var transferNote: String?
 
     @State private var showingImporter = false
     @State private var uploadProgress: FileUploadProgress?
@@ -183,6 +192,20 @@ struct FilesView: View {
         }
         .sheet(item: $previewEntry) { entry in
             ImagePreviewView(model: model, entry: entry)
+        }
+        .sheet(item: $pendingTransfer) { request in
+            DestinationPickerView(
+                model: model,
+                actionTitle: request.move ? "移动到这里" : "复制到这里",
+                blocked: Set(request.paths)
+            ) { destination in
+                Task { await performTransfer(request, to: destination) }
+            }
+        }
+        .alert("操作结果", isPresented: transferNoteBinding) {
+            Button("好", role: .cancel) { transferNote = nil }
+        } message: {
+            Text(transferNote ?? "")
         }
     }
 
@@ -462,6 +485,22 @@ struct FilesView: View {
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
+        .swipeActions(edge: .leading) {
+            if entry.isDeletable {
+                Button {
+                    pendingTransfer = TransferRequest(paths: [entry.path], move: false)
+                } label: {
+                    Label("复制", systemImage: "doc.on.doc")
+                }
+                .tint(.blue)
+                Button {
+                    pendingTransfer = TransferRequest(paths: [entry.path], move: true)
+                } label: {
+                    Label("移动", systemImage: "arrow.turn.down.right")
+                }
+                .tint(.indigo)
+            }
+        }
         .swipeActions(edge: .trailing) {
             if entry.isDeletable {
                 Button(role: .destructive) {
@@ -486,6 +525,18 @@ struct FilesView: View {
                     Task { await performDownload(entry) }
                 } label: {
                     Label("下载并分享", systemImage: "square.and.arrow.down")
+                }
+            }
+            if entry.isDeletable {
+                Button {
+                    pendingTransfer = TransferRequest(paths: [entry.path], move: false)
+                } label: {
+                    Label("复制到…", systemImage: "doc.on.doc")
+                }
+                Button {
+                    pendingTransfer = TransferRequest(paths: [entry.path], move: true)
+                } label: {
+                    Label("移动到…", systemImage: "arrow.turn.down.right")
                 }
             }
             if entry.isRenamable {
@@ -605,6 +656,15 @@ struct FilesView: View {
             get: { uploadSummary != nil },
             set: { visible in
                 if !visible { uploadSummary = nil }
+            }
+        )
+    }
+
+    private var transferNoteBinding: Binding<Bool> {
+        Binding(
+            get: { transferNote != nil },
+            set: { visible in
+                if !visible { transferNote = nil }
             }
         )
     }
@@ -822,6 +882,26 @@ struct FilesView: View {
             let data = try await model.downloadFile(path: entry.path)
             let url = try writeTemporary(data: data, name: entry.name)
             shared = SharedFile(url: url, name: entry.name)
+        } catch {
+            actionError = error.localizedDescription
+        }
+    }
+
+    /// 复制 / 移动。NAS 那边是异步任务且**没有进度查询接口**（见 FileTransferResult 注释），
+    /// 所以发出去之后只能轮询目标目录，落地了再刷新当前目录。
+    @MainActor
+    private func performTransfer(_ request: TransferRequest, to destination: String) async {
+        busyPath = request.paths.first ?? ""
+        defer { busyPath = nil }
+        do {
+            let result = try await model.fileTransfer(
+                paths: request.paths, to: destination, move: request.move
+            )
+            try await model.fileWaitTransfer(result)
+            await reload()
+            transferNote = request.move
+                ? "已移动到 \(destination)"
+                : "已复制到 \(destination)"
         } catch {
             actionError = error.localizedDescription
         }

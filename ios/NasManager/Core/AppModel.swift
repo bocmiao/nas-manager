@@ -633,6 +633,27 @@ final class AppModel {
         }
     }
 
+    /// 复制 / 移动。返回后任务还在后台跑，要等落地调 `fileWaitTransfer`。
+    @MainActor
+    func fileTransfer(paths: [String], to destination: String, move: Bool) async throws -> FileTransferResult {
+        guard let fileService = fileService else { throw UgosError.auth("尚未连接") }
+        do {
+            return try await fileService.copyOrMove(paths: paths, to: destination, move: move)
+        } catch {
+            throw UgosError.auth(FileService.friendly(error))
+        }
+    }
+
+    @MainActor
+    func fileWaitTransfer(_ result: FileTransferResult) async throws {
+        guard let fileService = fileService else { throw UgosError.auth("尚未连接") }
+        do {
+            try await fileService.waitForTransfer(result)
+        } catch {
+            throw UgosError.auth(FileService.friendly(error))
+        }
+    }
+
     @MainActor
     func downloadFile(path: String) async throws -> Data {
         guard let fileService = fileService else { throw UgosError.auth("尚未连接") }

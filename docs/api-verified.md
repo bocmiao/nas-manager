@@ -1096,3 +1096,56 @@ v1/vm/info   v1/vm/snapshot/list      v1/kvm/vm/list
 | `server/app/services/files.py` | `thumbnail()` 修正尺寸语义、`preview()` 新增 `mediaPlayer` 通道 |
 | `server/app/api/routes.py` | `GET /files/thumbnail`、`GET /files/preview` |
 | `scripts/test_media.py` | 22 项离线断言（请求形状 / 423 重试 / 路径安全） |
+
+## 四之九、复制 / 移动（85~88，2026-10-26 实测）
+
+> 文件管理器最基础的缺口。App 之前只能新建 / 改名 / 删除 / 上传 / 下载。
+
+85. **`cpOrMvPath` 的 `src` 必须是字符串路径数组**。
+    ```json
+    POST v2/filemgr/cpOrMvPath
+    {"dst": "/volume1/docker/sub", "src": ["/volume1/docker/a.txt"],
+     "action_type": 3, "type": false, "intranet_share_id": 0}
+    ```
+    传对象数组 `[{"path": "...", "intranet_share_id": 0}]`（像 `addPathsTask` 那样）
+    直接得到 **`9999 操作失败!`**。这点和 `delPaths` 一致。
+
+86. **`type` 是 `true` = 移动，`false` = 复制**（不是反过来）。
+
+87. **`action_type` 枚举**（从 `apps_filemgr` 的 `skip=0, cover=1, save=3, askEachTime=4` 反出，实测验证 3）：
+
+    | 值 | 含义 | 实测行为 |
+    |---|---|---|
+    | 0 | skip 跳过 | 同名时不动作 |
+    | 1 | cover 覆盖 | 同名时替换 |
+    | 3 | save 另存 | 生成 `hello(1).txt`、`hello(2).txt` |
+    | 4 | askEachTime | 逐项询问（前端弹窗用） |
+
+    **默认该用 3**：既不覆盖也不丢数据。
+
+88. **复制 / 移动是异步任务，而且查不到进度**。返回 `{"path": "", "task_id": "<uuid>"}`。
+
+    实测时序：复制 0.7 秒完成，移动 0.1 秒完成（都是几百字节小文件）。
+
+    但**没有任何可用的进度接口**：
+
+    | 查询方式 | 结果 |
+    |---|---|
+    | `getDelTaskInfo?task_id=<id>` | `9999 操作失败!` |
+    | `getDelTaskInfo?task_uuid=<id>` | `9999 操作失败!` |
+    | `getDelTaskInfo?uuid=<id>` | `1368 对象访问超时，您的任务不存在或已结束` |
+
+    `1368` 是新见到的错误码。**结论：客户端只能轮询目标目录判断落地**，
+    别去任务中心找这类任务。大文件的耗时未测（本机没有大文件样本），
+    轮询超时建议留足（代码里给 30 秒 × 1 秒间隔）。
+
+### 落地
+
+| 位置 | 做了什么 |
+|---|---|
+| `server/app/services/files.py` | `copy_or_move()`：字符串数组校验、拒绝「移动到自己的子目录」、`action_type` 常量 |
+| `server/app/api/routes.py` | `POST /files/transfer` |
+| `ios/NasManager/Core/FileService.swift` | `copyOrMove(paths:to:move:)` + `waitForTransfer()` 轮询落地 |
+| `ios/NasManager/Views/DestinationPickerView.swift` | 目标目录选择器，只列目录，被操作条目自身不可选 |
+| `ios/NasManager/Views/FilesView.swift` | 左滑「复制 / 移动」+ 右键菜单「复制到… / 移动到…」 |
+| `scripts/probe_copy_move.py` / `probe_copy_move2.py` | 真机契约探针（沙盒目录，测完删除） |
