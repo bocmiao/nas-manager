@@ -1,4 +1,5 @@
 import Foundation
+import CryptoKit
 
 // MARK: - 排序
 
@@ -334,6 +335,15 @@ struct FileSpace: Decodable, Hashable {
 struct FileDeleteResult: Decodable, Hashable {
     var deleted: [String]
     var forever: Bool
+}
+
+/// 上传结果。NAS 只回 `data.result` 一个落盘路径，`name` / `size` 在本地补齐。
+///
+/// 注意 `path` 可能是改名后的路径（`名字(1).后缀`），是不是原名要看 `name`。
+struct FileUploadResult: Decodable, Hashable {
+    let path: String
+    let name: String
+    let size: UInt64
 }
 
 // MARK: - 原始返回包装
@@ -776,6 +786,102 @@ final class FileService {
         return FileDeleteResult(deleted: cleaned, forever: forever)
     }
 
+    // MARK: 上传
+
+    /// 单块上限 4MB：块太大在弱网下整块重传代价高，4MB 是实测比较稳的值
+    static let uploadChunkSize = 4 * 1024 * 1024
+
+    /// 上传一个文件。协议是「参数全在 header + body 放裸字节」的分块**追加**：
+    /// 每块一次 `POST v1/filemgr/fileUploadV2`，`begin_size` 是本块在文件里的偏移，
+    /// `size` 恒为文件总长，`current_size` 是本块长度。
+    ///
+    /// `actionType` 默认 **3 = 同名自动改名**（`名字(1).后缀`）。0/1/2 会静默覆盖同名文件，
+    /// 真机上等于毁掉用户已有文件，所以 App 里不给入口。
+    func upload(
+        fileData: Data,
+        filename: String,
+        destPath: String,
+        actionType: Int = 3
+    ) async throws -> FileUploadResult {
+        let name = filename.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !name.isEmpty else { throw UgosError.auth("文件名不能为空") }
+        guard !name.contains("/"), name != ".", name != ".." else {
+            throw UgosError.auth("文件名不能包含 / 也不能是 . 或 ..")
+        }
+        let dir = destPath.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !dir.isEmpty else { throw UgosError.auth("缺少目标目录") }
+        guard !fileData.isEmpty else { throw UgosError.auth("文件内容为空，无法上传") }
+
+        // HTTP header 只承载 ASCII；中文文件名 / 中文目录必须先 URL 编码，否则直接失败
+        guard let encodedName = FileService.percentEncoded(name),
+              let encodedDir = FileService.percentEncoded(dir) else {
+            throw UgosError.auth("文件名或目录无法编码")
+        }
+
+        // uuid = 文件名的 md5 小写 hex，NAS 靠它把同一个文件的多个分块关联起来
+        let digest = Insecure.MD5.hash(data: Data(name.utf8))
+        let uuid = digest.map { String(format: "%02x", $0) }.joined()
+
+        let total = fileData.count
+        // change_time 必须是 int64 unix 秒。传 "2026-10-26 10:00:00" 会被 NAS（Go）反序列化
+        // 直接拒绝：cannot unmarshal string into Go struct field ...ChangeTime of type int64
+        let changeTime = Int64(Date().timeIntervalSince1970)
+
+        var offset = 0
+        var resultPath = ""
+
+        while offset < total {
+            let end = min(offset + FileService.uploadChunkSize, total)
+            let chunk = fileData.subdata(in: offset..<end)
+            let param: [String: Any] = [
+                "uuid": uuid,
+                "file_name": encodedName,
+                "action_type": actionType,
+                "size": total,
+                "current_size": chunk.count,
+                "resume": true,
+                "dir": encodedDir,
+                "change_time": changeTime,
+                "is_live_photo": false,
+                "first_request": false,
+                "begin_size": offset
+            ]
+            // 单行、无空格的 JSON：`ug-param` 是 header 值，不能含换行
+            guard JSONSerialization.isValidJSONObject(param),
+                  let paramData = try? JSONSerialization.data(withJSONObject: param),
+                  let paramJSON = String(data: paramData, encoding: .utf8) else {
+                throw UgosError.decoding("上传参数序列化失败")
+            }
+            let headers: [String: String] = [
+                "Content-Type": "application/octet-stream",
+                "Content-Disposition": "attachment; filename=\"\(encodedName)\"",
+                "ug-param": paramJSON
+            ]
+            let response = try await client.postRaw(
+                "v1/filemgr/fileUploadV2", data: chunk, headers: headers
+            )
+            if let landed = FileService.text(FileService.field(response, "result")),
+               !landed.isEmpty {
+                resultPath = landed
+            }
+            offset = end
+        }
+
+        // 以 NAS 返回的落盘路径为准：启用自动改名时它可能是 `名字(1).后缀`
+        let resolved: String
+        if resultPath.isEmpty {
+            resolved = dir.hasSuffix("/") ? dir + name : dir + "/" + name
+        } else {
+            resolved = resultPath
+        }
+        let landedName = (resolved as NSString).lastPathComponent
+        return FileUploadResult(
+            path: resolved,
+            name: landedName.isEmpty ? name : landedName,
+            size: UInt64(total)
+        )
+    }
+
     // MARK: 空间
 
     func freeSpace(path: String) async throws -> FileSpace {
@@ -804,6 +910,21 @@ final class FileService {
     }
 
     // MARK: - 解析辅助
+
+    /// 与 Python 的 `quote(value, safe="")` 等价：只保留 RFC 3986 的 unreserved 字符。
+    /// 不能用 `.urlQueryAllowed`（会漏掉 `+ & =`），也不能用 `CharacterSet.alphanumerics`
+    /// （它把中文也算字母，等于没编码）。`/` 一并编码，NAS 侧按 `%2F` 传是已验证行为。
+    private static let unreservedCharacters: CharacterSet = {
+        var set = CharacterSet()
+        set.insert(charactersIn: "ABCDEFGHIJKLMNOPQRSTUVWXYZ")
+        set.insert(charactersIn: "abcdefghijklmnopqrstuvwxyz")
+        set.insert(charactersIn: "0123456789-._~")
+        return set
+    }()
+
+    private static func percentEncoded(_ value: String) -> String? {
+        value.addingPercentEncoding(withAllowedCharacters: unreservedCharacters)
+    }
 
     private static func decodeEntry(_ any: Any) -> FileEntry? {
         guard JSONSerialization.isValidJSONObject(any),

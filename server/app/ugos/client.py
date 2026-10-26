@@ -229,6 +229,28 @@ class UgosClient:
             return await self.delete(path, body, params, retry=False, headers=headers)
         raise UgosError(code, data.get("msg") or "", path, data.get("debug") or "")
 
+    async def post_raw(self, path: str, content: bytes, headers: dict | None = None,
+                       params: dict | None = None, *, retry: bool = True):
+        """POST 原始字节（文件上传）。
+
+        上传接口的参数全在 header 里（`ug-param`），body 是裸字节流，
+        不能走 `post()` 的 JSON 序列化。token 仍然走 query。
+        """
+        token = await self._ensure_token()
+        q = dict(params or {})
+        q["token"] = token
+        r = await self._http.post(self._url(path), content=content, params=q, headers=headers)
+        data = self._parse(r, path)
+
+        code = data.get("code")
+        if code == 200:
+            return data.get("data")
+        if code in AUTH_FAIL_CODES and retry:
+            log.warning("会话失效 code=%s，重新登录后重试 %s", code, path)
+            await self._relogin()
+            return await self.post_raw(path, content, headers, params, retry=False)
+        raise UgosError(code, data.get("msg") or "", path, data.get("debug") or "")
+
     def open_stream(self, path: str, params: dict | None = None):
         """给不出来自 NAS 的二进制流（文件下载）。
 

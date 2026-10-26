@@ -31,8 +31,12 @@
 """
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
 import posixpath
+import time
+from urllib.parse import quote
 
 from ..cache import TTLCache
 from ..config import Settings
@@ -59,6 +63,17 @@ SORT_CODES = {v: k for k, v in SORT_TYPES.items()}
 
 FILE_TYPE_DIR = 1
 ROOT_TAG = 9     # 标签根：条目是标签定义，不是文件
+
+# 上传行为（实测，见 docs/api-verified.md §七）
+# 0/1/2 都会**静默覆盖**同名文件；3 会自动改名成 `名字(1).后缀`。
+# 管理端默认用 3：宁可多一个文件，也不悄悄毁掉用户的同名文件。
+UPLOAD_AUTO_RENAME = 3
+UPLOAD_OVERWRITE = 1
+UPLOAD_ACTION_LABELS = {0: "覆盖", 1: "覆盖", 2: "覆盖", 3: "同名自动改名"}
+
+# 单次 POST 承载的字节数。NAS 侧不限制块大小（前端从 128KB 自增到 100MB），
+# 这里取 8MB：既不会让网关超时，也不会把内存吃满。
+UPLOAD_CHUNK_SIZE = 8 * 1024 * 1024
 
 # 常见后缀归组，供客户端选图标；纯展示辅助，与 NAS 语义无关
 EXT_GROUPS = {
@@ -303,6 +318,104 @@ class FileService:
             raise FileRejected("paths 里有非字符串项")
         await self._c.post("v2/filemgr/delPaths", {"paths": cleaned, "forever": bool(forever)})
         return {"deleted": cleaned, "forever": bool(forever)}
+
+    # ------------------------------------------------------------- 上传
+
+    async def upload(
+        self,
+        dest_dir: str,
+        filename: str,
+        total: int,
+        chunks,
+        action_type: int = UPLOAD_AUTO_RENAME,
+    ) -> dict:
+        """流式上传一个文件。
+
+        协议是「参数全在 header + body 放裸字节」的分块续传：
+        每块一次 `POST v1/filemgr/fileUploadV2`，`begin_size` 是本块在文件里的偏移，
+        `current_size` 是本块长度，`size` 是文件总长。实测分块是**追加**语义。
+
+        这里只做串行转发：不落盘、不在内存里攒整个文件。
+        `chunks` 是异步字节迭代器（路由层直接传 `request.stream()`）。
+        """
+        clean_dir = sanitize_path(dest_dir)
+        if not filename or "/" in filename or "\x00" in filename:
+            raise FileRejected("文件名不能为空且不能包含 /")
+        if filename in (".", ".."):
+            raise FileRejected("文件名非法")
+        if total <= 0:
+            raise FileRejected("文件大小必须大于 0")
+        if action_type not in UPLOAD_ACTION_LABELS:
+            raise FileRejected("action_type 只支持 0/1/2/3")
+
+        uid = hashlib.md5(filename.encode("utf-8")).hexdigest()
+        offset = 0
+        result_path = ""
+
+        async for raw in chunks:
+            if not raw:
+                continue
+            # 单块超过阈值就切开，让每个请求都保持可控大小
+            pos = 0
+            while pos < len(raw):
+                piece = raw[pos: pos + UPLOAD_CHUNK_SIZE]
+                pos += len(piece)
+                if offset + len(piece) > total:
+                    raise FileRejected(
+                        f"收到的字节数超过声明的 {total}，可能是 Content-Length 不实"
+                    )
+                data = await self._upload_chunk(
+                    clean_dir, filename, uid, total, piece, offset, action_type
+                )
+                path = (data or {}).get("result")
+                if path:
+                    result_path = path
+                offset += len(piece)
+
+        if offset != total:
+            raise FileRejected(f"实际收到 {offset} 字节，与声明的 {total} 不一致")
+
+        return {
+            "path": result_path,
+            "name": posixpath.basename(result_path) or filename,
+            "dir": clean_dir,
+            "size": total,
+            "action_type": action_type,
+            "action": UPLOAD_ACTION_LABELS[action_type],
+        }
+
+    async def _upload_chunk(
+        self,
+        dest_dir: str,
+        filename: str,
+        uid: str,
+        total: int,
+        piece: bytes,
+        offset: int,
+        action_type: int,
+    ):
+        # header 只能是 ASCII：file_name / dir 必须 URL 编码，
+        # 否则中文名会直接编码失败（前端也是 encodeURIComponent）。
+        param = {
+            "uuid": uid,
+            "file_name": quote(filename, safe=""),
+            "action_type": action_type,
+            "size": total,
+            "current_size": len(piece),
+            "resume": True,
+            "dir": quote(dest_dir, safe=""),
+            # 必须是 int64 unix 秒；传 "YYYY-MM-DD hh:mm:ss" 会被 Go 反序列化拒绝
+            "change_time": int(time.time()),
+            "is_live_photo": False,
+            "first_request": False,
+            "begin_size": offset,
+        }
+        headers = {
+            "Content-Type": "application/octet-stream",
+            "Content-Disposition": f'attachment; filename="{quote(filename, safe="")}"',
+            "ug-param": json.dumps(param, ensure_ascii=True, separators=(",", ":")),
+        }
+        return await self._c.post_raw("v1/filemgr/fileUploadV2", piece, headers=headers)
 
     # ------------------------------------------------------------- 空间
 

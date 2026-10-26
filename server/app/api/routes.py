@@ -1091,3 +1091,33 @@ async def files_space(
         return ok(await files.free_space(path))
     except FileRejected as exc:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, detail=exc.msg) from exc
+
+
+@router.post("/files/upload", dependencies=[Depends(require_auth)])
+async def files_upload(
+    request: Request,
+    parent: str = Query(..., description="目标目录绝对路径"),
+    name: str = Query(..., description="文件名，不含路径"),
+    action_type: int = Query(
+        3, description="0/1/2 静默覆盖同名文件；3 同名自动改名（默认，不覆盖）"
+    ),
+    files: FileService = Depends(get_files),
+):
+    """上传单个文件：请求体就是文件裸字节，**必须**带 `Content-Length`。
+
+    分块续传的细节封在服务层：这里把请求体当流读，逐块转给 NAS，不落盘也不整文件驻留内存。
+    """
+    length = request.headers.get("content-length", "")
+    if not length.isdigit():
+        raise HTTPException(
+            status.HTTP_411_LENGTH_REQUIRED,
+            detail="上传必须带 Content-Length；不支持 chunked 请求体",
+        )
+    total = int(length)
+    if total <= 0:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, detail="文件内容为空")
+
+    try:
+        return ok(await files.upload(parent, name, total, request.stream(), action_type))
+    except FileRejected as exc:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, detail=exc.msg) from exc

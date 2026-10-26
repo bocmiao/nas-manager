@@ -273,6 +273,64 @@ actor UgosClient {
         return try await perform(path: path, method: "POST", params: params, body: body)
     }
 
+    /// POST 原始字节。文件上传的参数全在 header（`ug-param`），body 是这一块的裸字节，
+    /// 走不了 `post` 的 JSON 序列化。token 仍走 query，会话过期的重登重试与 `post` 一致。
+    func postRaw(
+        _ path: String,
+        data: Data,
+        headers: [String: String]
+    ) async throws -> Any {
+        try await performRaw(path: path, data: data, headers: headers, allowRetry: true)
+    }
+
+    private func performRaw(
+        path: String,
+        data: Data,
+        headers: [String: String],
+        allowRetry: Bool
+    ) async throws -> Any {
+        if token.isEmpty { try await relogin() }
+
+        var request = URLRequest(url: try url(path, queryItems: [("token", token)]))
+        request.httpMethod = "POST"
+        for (key, value) in Self.agentHeaders {
+            request.setValue(value, forHTTPHeaderField: key)
+        }
+        // 调用方的头最后写，才能覆盖默认的 Content-Type: application/json
+        for (key, value) in headers {
+            request.setValue(value, forHTTPHeaderField: key)
+        }
+        request.httpBody = data
+
+        let (http, responseData) = try await rawExecute(request)
+
+        let json: [String: Any]
+        do {
+            json = try decodeJSON(responseData, path: path)
+        } catch {
+            throw UgosError.http(http.statusCode)
+        }
+
+        let code = json["code"] as? Int ?? -1
+        if code == 200 {
+            return json["data"] ?? [:]
+        }
+
+        // NAS 的 9999 常把真正原因写在 debug 里，跟着 msg 一起带出来
+        let msg = (json["msg"] as? String) ?? ""
+        let debug = (json["debug"] as? String) ?? ""
+        let message = debug.isEmpty ? msg : (msg.isEmpty ? debug : "\(msg) \(debug)")
+        let error = UgosError.business(code: code, message: message, path: path)
+
+        if allowRetry, error.requiresRelogin {
+            try await relogin()
+            return try await performRaw(
+                path: path, data: data, headers: headers, allowRetry: false
+            )
+        }
+        throw error
+    }
+
     /// DELETE。部分接口要求把参数放 body（如快照删除），这里允许 json 为 nil。
     func delete(
         _ path: String,

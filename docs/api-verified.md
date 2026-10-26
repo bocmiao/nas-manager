@@ -358,10 +358,46 @@ X-CurPass-Token: <RSA 加密后的账号密码>
 
 `forever=false` 走回收站（与网页端默认一致），`true` 直删。
 
+#### 上传（参数全在 header，body 是裸字节）
+
+`POST v1/filemgr/fileUploadV2`（注意是 **v1**，不是 v2）
+
+| header | 值 |
+|---|---|
+| `Content-Type` | `application/octet-stream` |
+| `Content-Disposition` | `attachment; filename="<文件名 URL 编码>"` |
+| `ug-param` | 单行 JSON，见下 |
+
+```json
+{"uuid":"<文件名 md5 hex>","file_name":"<URL 编码>","action_type":3,
+ "size":<总字节>,"current_size":<本块字节>,"resume":true,
+ "dir":"<目标目录 URL 编码>","change_time":<int64 unix 秒>,
+ "is_live_photo":false,"first_request":false,"begin_size":<本块偏移>}
+```
+
+返回 `{result: "<最终落盘路径>"}`——注意 `result` 可能是改名后的路径。
+
+**分块是追加语义**：实测 400B（`begin_size=0`）+ 400B（`begin_size=400`）
+→ 800B 文件，内容正确拼接。`size` 每块都传总长，`current_size` 是**本块**长度。
+
+`action_type` 实测行为：
+
+| 值 | 同名文件 |
+|---|---|
+| 0 / 1 / 2 | **静默覆盖**（原文件没了，没有任何提示） |
+| 3 | 自动改名成 `名字(1).后缀` |
+
+管理端默认用 `3`——覆盖是破坏性操作，不能让用户误触。
+
+中文文件名与中文目录都可以传，前提是 `file_name` / `dir` 都做了 URL 编码
+（header 的值只能是 ASCII，不编码会直接编码失败）。
+
 #### 已知但未实现的 filemgr 能力
 
-前端 bundle 里还有这些接口，未做实测（按需再探）：
-`fileUpload` / `fileUploadV2`（上传，multipart + 临时文件两段式）、
+前端 bundle 里还有这些接口，未做实测（按需再探）。
+上传端点已经跑通（见上面「上传」小节），但**续传**（`v1/filemgr/fileUpload` 预检 +
+`getUpdateTmpInfo` 查询已传大小 + `delUpTemFile` 清理临时文件）只验证到"预检返回
+`1005 request message format error`"，没有继续逆 multipart 分支——单块/多块从头传已够用。
 `getAllLevelsPath`（整树递归）、`createsearchtask` / `getsearchtaskresult`（异步搜索）、
 `cpOrMvPath`（复制/移动，`{dst, src, action_type, type, intranet_share_id}`）、
 `thumbnail` / `getIcon`（缩略图）、`compressedFile` / `unCompressedFile`（压缩解压）、
@@ -851,3 +887,19 @@ v1/vm/info   v1/vm/snapshot/list      v1/kvm/vm/list
     客户端拿到的是 `incomplete chunked read` / `peer closed connection`，而不是结构化错误。
     正确做法是 `await ctx.__aenter__()` → 检查 `status_code` → 不合格就读完 body、
     退出上下文、抛异常；合格才把已经进入的上下文交给生成器，`finally` 里退出。
+
+## 四之五、上传踩坑（67~71）
+
+67. **`change_time` 必须是 int64 unix 秒**。传 `"2026-10-26 10:00:00"` 这种格式化字符串，
+    NAS 会用 Go 的反序列化错误回你：`json: cannot unmarshal number "" into Go struct field
+    UploadFileHeaderParamInfo.ChangeTime of type int64`。前端那个 `Mh()` 就是转秒，不是格式化。
+68. **`ug-param` 里的 `file_name` 和 `dir` 必须 URL 编码**。HTTP header 只能承载 ASCII，
+    中文名不编码会在客户端就报 `UnicodeEncodeError`（或被 NAS 当乱码）。
+    注意只编码这两个**值**，不要把整个 JSON 编码。
+69. **`action_type` 0/1/2 都是静默覆盖**。想"保留原文件"只能用 `3`（改成 `名字(1).后缀`）。
+    这是最容易造成不可逆数据丢失的一个参数，客户端默认值必须是 3。
+70. **端点版本是 `v1` 不是 `v2`**：`v1/filemgr/fileUploadV2`。
+    路径里带 `V2` 字样但版本段是 `v1`，`v2/filemgr/fileUploadV2` 不存在。
+71. **预检端点不适合当"文件是否存在"的探针**：`v1/filemgr/fileUpload` 传空 body 返回
+    `1005 参数错误 request message format error`，因为它的正常形态是 multipart。
+    判断同名文件直接列目录即可（`getDirFileListV2`）。

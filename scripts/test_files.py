@@ -27,6 +27,8 @@ from app.services.files import (  # noqa: E402
     FileService,
     ROOT_CATEGORIES,
     SORT_CODES,
+    UPLOAD_AUTO_RENAME,
+    UPLOAD_CHUNK_SIZE,
     normalize_entry,
     sanitize_path,
 )
@@ -45,6 +47,7 @@ class FakeClient:
 
     def __init__(self, responses: dict[str, object] | None = None) -> None:
         self.calls: list[tuple[str, str, object, object]] = []
+        self.raw_calls: list[dict] = []
         self._responses = responses or {}
 
     def _record(self, method: str, path: str, payload) -> object:
@@ -58,6 +61,12 @@ class FakeClient:
 
     async def post(self, path: str, body=None, params=None, **_kw):
         return self._record("POST", path, body)
+
+    async def post_raw(self, path: str, content: bytes, headers=None, **_kw):
+        self.raw_calls.append({"path": path, "size": len(content), "headers": headers})
+        return {"result": "/volume1/docker/上传结果.bin"}
+
+    raw_calls: list = []
 
 
 class FakeNas:
@@ -350,7 +359,114 @@ def test_download() -> None:
     asyncio.run(run())
 
 
-# ---------------------------------------------------------------- 6. 根分类
+# ---------------------------------------------------------------- 6. 上传
+
+async def _drain(data: bytes, pieces: int = 1):
+    step = max(1, len(data) // pieces)
+    for i in range(0, len(data), step):
+        yield data[i: i + step]
+
+
+def test_upload() -> None:
+    print("\n[7] 上传请求形状")
+
+    async def run():
+        s, c = svc()
+        c.raw_calls = []
+        payload = bytes(range(256)) * 40      # 10240 字节
+        res = await s.upload("/volume1/docker/backup", "文件 名.bin", len(payload),
+                             _drain(payload, 4))
+
+        check("返回体大小正确", res["size"] == len(payload), str(res["size"]))
+        check("默认 action_type=3（同名自动改名）", res["action_type"] == UPLOAD_AUTO_RENAME,
+              str(res["action_type"]))
+        check("默认动作文案说明不覆盖", "改名" in res["action"], res["action"])
+
+        calls = c.raw_calls
+        check("打到 v1/filemgr/fileUploadV2（v1 不是 v2）",
+              all(x["path"] == "v1/filemgr/fileUploadV2" for x in calls),
+              str({x["path"] for x in calls}))
+
+        import json as _json
+        params = [_json.loads(x["headers"]["ug-param"]) for x in calls]
+        want_keys = {"uuid", "file_name", "action_type", "size", "current_size",
+                     "resume", "dir", "change_time", "is_live_photo",
+                     "first_request", "begin_size"}
+        check("ug-param 字段齐全且不多不少", set(params[0]) == want_keys,
+              str(sorted(set(params[0]) ^ want_keys)))
+
+        check("各块 size 恒为总长", all(x["size"] == len(payload) for x in params),
+              str([x["size"] for x in params]))
+        check("begin_size 从 0 递增且首尾相接",
+              [x["begin_size"] for x in params] ==
+              [0] + [x["begin_size"] + x["current_size"] for x in params[:-1]],
+              str([(x["begin_size"], x["current_size"]) for x in params]))
+        check("current_size 之和等于总长",
+              sum(x["current_size"] for x in params) == len(payload))
+        check("change_time 是 int 不是字符串",
+              all(isinstance(x["change_time"], int) for x in params),
+              str(type(params[0]["change_time"])))
+        check("file_name 已 URL 编码（无中文）",
+              all(x["file_name"].isascii() for x in params), params[0]["file_name"])
+        check("dir 已 URL 编码（无中文）",
+              all(x["dir"].isascii() for x in params), params[0]["dir"])
+        check("uuid 是文件名 md5（32 位小写 hex）",
+              len(params[0]["uuid"]) == 32 and params[0]["uuid"].islower(),
+              params[0]["uuid"])
+        check("所有块 uuid 一致",
+              len({x["uuid"] for x in params}) == 1)
+        check("Content-Type 是八位字节流",
+              all(x["headers"]["Content-Type"] == "application/octet-stream"
+                  for x in calls))
+        check("Content-Disposition 格式正确",
+              all(x["headers"]["Content-Disposition"].startswith('attachment; filename="')
+                  for x in calls), calls[0]["headers"]["Content-Disposition"])
+        check("ug-param 是单行 JSON（无换行）",
+              all("\n" not in x["headers"]["ug-param"] for x in calls))
+
+        # 单块超过阈值要被切开
+        c.raw_calls = []
+        big = b"x" * (UPLOAD_CHUNK_SIZE * 2 + 100)
+        await s.upload("/volume1/docker", "big.bin", len(big), _drain(big, 1))
+        check("超过 8MB 的单块被切成多块", len(c.raw_calls) == 3, str(len(c.raw_calls)))
+        check("切块后总字节仍一致",
+              sum(x["size"] for x in c.raw_calls) == len(big))
+
+        # 本地拒绝
+        for args, why in [
+            (("/volume1/docker", "a/b", 10, None, 3), "文件名带 /"),
+            (("/volume1/docker", "", 10, None, 3), "文件名为空"),
+            (("/volume1/docker", "a.txt", 0, None, 3), "大小为 0"),
+            (("/volume1/docker", "a.txt", 10, None, 9), "非法 action_type"),
+            (("relative", "a.txt", 10, None, 3), "目标目录是相对路径"),
+        ]:
+            c.raw_calls = []
+            try:
+                await s.upload(*args)
+                check(f"上传拒绝{why}", False, "未拒绝")
+            except FileRejected:
+                check(f"上传拒绝{why}", True)
+            check(f"上传{why} 未发请求", len(c.raw_calls) == 0)
+
+        # 声明大小与实际不符
+        c.raw_calls = []
+        try:
+            await s.upload("/volume1/docker", "a.txt", 100, _drain(b"x" * 10, 1))
+            check("声明大小大于实际要报错", False, "未报错")
+        except FileRejected:
+            check("声明大小大于实际要报错", True)
+
+        c.raw_calls = []
+        try:
+            await s.upload("/volume1/docker", "a.txt", 5, _drain(b"x" * 10, 1))
+            check("实际大于声明要报错", False, "未报错")
+        except FileRejected:
+            check("实际大于声明要报错", True)
+
+    asyncio.run(run())
+
+
+# ---------------------------------------------------------------- 7. 根分类
 
 def test_roots() -> None:
     print("\n[8] 根分类与卷")
@@ -408,6 +524,7 @@ def main() -> int:
     test_listing_shape()
     test_writes()
     test_download()
+    test_upload()
     test_roots()
 
     failed = [r for r in results if r[0] == FAIL]

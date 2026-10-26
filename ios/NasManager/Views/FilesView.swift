@@ -1,5 +1,6 @@
 import Foundation
 import SwiftUI
+import UniformTypeIdentifiers
 
 // MARK: - 路径栈节点
 
@@ -17,6 +18,13 @@ struct FileNode: Hashable, Identifiable {
 private struct SharedFile: Identifiable {
     let id = UUID()
     let url: URL
+    let name: String
+}
+
+/// 上传进度。多文件是顺序上传，这里只记「第几个 / 共几个 + 当前文件名」
+private struct FileUploadProgress {
+    let index: Int
+    let total: Int
     let name: String
 }
 
@@ -51,6 +59,10 @@ struct FilesView: View {
     @State private var actionError: String?
     @State private var shared: SharedFile?
 
+    @State private var showingImporter = false
+    @State private var uploadProgress: FileUploadProgress?
+    @State private var uploadSummary: String?
+
     var body: some View {
         List {
             if stack.isEmpty {
@@ -77,6 +89,19 @@ struct FilesView: View {
                 }
             }
             ToolbarItem(placement: .topBarTrailing) {
+                Button {
+                    showingImporter = true
+                } label: {
+                    if uploadProgress != nil {
+                        ProgressView()
+                    } else {
+                        Image(systemName: "arrow.up.doc")
+                    }
+                }
+                .disabled(!canUpload)
+                .accessibilityLabel("上传文件")
+            }
+            ToolbarItem(placement: .topBarTrailing) {
                 if canCreateFolder {
                     Button {
                         newFolderName = ""
@@ -84,7 +109,20 @@ struct FilesView: View {
                     } label: {
                         Image(systemName: "folder.badge.plus")
                     }
+                    .disabled(uploadProgress != nil)
                 }
+            }
+        }
+        .fileImporter(
+            isPresented: $showingImporter,
+            allowedContentTypes: [.item],
+            allowsMultipleSelection: true
+        ) { result in
+            switch result {
+            case .success(let urls):
+                Task { await performUploads(urls) }
+            case .failure(let error):
+                actionError = "选择文件失败：\(error.localizedDescription)"
             }
         }
         .alert("新建文件夹", isPresented: $showingNewFolder) {
@@ -129,6 +167,11 @@ struct FilesView: View {
             Button("好", role: .cancel) { actionError = nil }
         } message: {
             Text(actionError ?? "")
+        }
+        .alert("上传结果", isPresented: uploadSummaryBinding) {
+            Button("好", role: .cancel) { uploadSummary = nil }
+        } message: {
+            Text(uploadSummary ?? "")
         }
         .sheet(item: $shared) { file in
             shareSheet(file)
@@ -201,6 +244,14 @@ struct FilesView: View {
                     Text("这里只展示卷的容量。浏览请在「位置」里选分类——直接访问卷路径会被 NAS 判为越权。")
                 }
             }
+
+            Section {
+                Label("上传需要先进入具体文件夹", systemImage: "arrow.up.doc")
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+            } footer: {
+                Text("根分类只是入口，不是可写路径，所以这里的上传按钮是灰的。上传时同名文件会自动改名为「名称(1).后缀」，不会覆盖已有文件。")
+            }
         }
     }
 
@@ -260,6 +311,24 @@ struct FilesView: View {
 
     @ViewBuilder
     private var entriesSection: some View {
+        if let progress = uploadProgress {
+            Section {
+                HStack(spacing: 10) {
+                    ProgressView()
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("正在上传…（\(progress.index)/\(progress.total)）")
+                            .font(.footnote)
+                        Text(progress.name)
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                    }
+                }
+            } footer: {
+                Text("同名文件会自动改名为「名称(1).后缀」，不会覆盖已有文件。")
+            }
+        }
+
         if isLoading && entries.isEmpty {
             Section {
                 HStack(spacing: 8) {
@@ -509,12 +578,28 @@ struct FilesView: View {
         )
     }
 
+    private var uploadSummaryBinding: Binding<Bool> {
+        Binding(
+            get: { uploadSummary != nil },
+            set: { visible in
+                if !visible { uploadSummary = nil }
+            }
+        )
+    }
+
     // MARK: 导航
 
     /// 只有当前目录有真实路径才能建子目录：根分类没有 path，NAS 也不接受 path=/ 的写法
     private var canCreateFolder: Bool {
         guard let current = stack.last else { return false }
         return current.path?.isEmpty == false
+    }
+
+    /// 上传同理：根分类只是入口，不是可写路径；上传进行中也不允许再次触发
+    private var canUpload: Bool {
+        guard uploadProgress == nil else { return false }
+        guard let current = stack.last, let path = current.path else { return false }
+        return !path.isEmpty
     }
 
     private func push(_ node: FileNode) {
@@ -714,6 +799,60 @@ struct FilesView: View {
             shared = SharedFile(url: url, name: entry.name)
         } catch {
             actionError = error.localizedDescription
+        }
+    }
+
+    /// 顺序上传选中的文件：多选时逐个来，避免同时开多条大流量连接把 NAS 打满。
+    @MainActor
+    private func performUploads(_ urls: [URL]) async {
+        guard uploadProgress == nil else { return }
+        guard let dest = stack.last?.path, !dest.isEmpty else {
+            actionError = "根分类不是可写路径，请先进入具体文件夹再上传"
+            return
+        }
+        guard !urls.isEmpty else { return }
+
+        var landed: [String] = []
+        var failures: [String] = []
+
+        for (index, url) in urls.enumerated() {
+            let filename = url.lastPathComponent
+            uploadProgress = FileUploadProgress(
+                index: index + 1, total: urls.count, name: filename
+            )
+
+            // 文件选择器给出的 URL 是 security-scoped：不申请就读取会被系统直接拒绝，
+            // 申请后必须配对释放，否则引用计数泄漏。
+            _ = url.startAccessingSecurityScopedResource()
+            defer { url.stopAccessingSecurityScopedResource() }
+
+            do {
+                guard !filename.isEmpty else { throw UgosError.auth("文件名缺失") }
+                let data = try Data(contentsOf: url, options: .mappedIfSafe)
+                let result = try await model.uploadFile(
+                    data: data, filename: filename, destPath: dest
+                )
+                landed.append(result.name)
+            } catch {
+                failures.append("\(filename)：\(error.localizedDescription)")
+            }
+        }
+
+        uploadProgress = nil
+
+        if !landed.isEmpty {
+            await loadDirectory(reset: true)
+        }
+
+        var lines: [String] = []
+        if !landed.isEmpty {
+            lines.append("已上传 \(landed.count) 个文件：\n" + landed.joined(separator: "\n"))
+        }
+        if !failures.isEmpty {
+            lines.append("失败 \(failures.count) 个：\n" + failures.joined(separator: "\n"))
+        }
+        if !lines.isEmpty {
+            uploadSummary = lines.joined(separator: "\n\n")
         }
     }
 

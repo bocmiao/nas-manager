@@ -646,6 +646,27 @@ final class AppModel {
         }
     }
 
+    /// 上传文件（分块追加）。默认 `actionType: 3` = 同名自动改名，不覆盖已有文件。
+    @MainActor
+    func uploadFile(
+        data: Data,
+        filename: String,
+        destPath: String,
+        actionType: Int = 3
+    ) async throws -> FileUploadResult {
+        guard let fileService = fileService else { throw UgosError.auth("尚未连接") }
+        do {
+            return try await fileService.upload(
+                fileData: data,
+                filename: filename,
+                destPath: destPath,
+                actionType: actionType
+            )
+        } catch {
+            throw UgosError.auth(FileService.friendly(error))
+        }
+    }
+
     // MARK: 运维工具（只读）
 
     @MainActor
