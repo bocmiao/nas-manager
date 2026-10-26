@@ -14,6 +14,7 @@ struct SettingsView: View {
                 serverSection
                 securitySection
                 refreshSection
+                opsSection
                 aboutSection
             }
             .navigationTitle("设置")
@@ -268,6 +269,23 @@ struct SettingsView: View {
             Text("数据刷新")
         } footer: {
             Text("前台轮询间隔，间隔越短越及时也越费电。固件只做版本提醒，升级请到 UGOS 网页端操作。")
+        }
+    }
+
+    // MARK: 运维
+
+    @ViewBuilder
+    private var opsSection: some View {
+        Section {
+            NavigationLink {
+                OpsToolsView(model: model)
+            } label: {
+                Label("运维工具", systemImage: "wrench.and.screwdriver")
+            }
+        } header: {
+            Text("运维")
+        } footer: {
+            Text("系统日志、会话与登录审计、风扇、备份任务、电源计划，以及镜像与快照的汇总入口。这些页面只读，不做任何写操作。")
         }
     }
 

@@ -94,6 +94,11 @@ actor UgosClient {
     // MARK: URL 构造
 
     private func url(_ path: String, query: [String: String]) throws -> URL {
+        try url(path, queryItems: query.map { ($0.key, $0.value) })
+    }
+
+    /// 用有序键值对建 URL，允许同名参数重复出现（`?level=info&level=warning`）。
+    private func url(_ path: String, queryItems: [(String, String)]) throws -> URL {
         guard let base = endpoint.baseURL else {
             throw UgosError.transport("地址非法：\(endpoint.displayName)")
         }
@@ -102,8 +107,8 @@ actor UgosClient {
         guard var comps = URLComponents(url: base.appendingPathComponent(p), resolvingAgainstBaseURL: false) else {
             throw UgosError.transport("URL 构造失败")
         }
-        if !query.isEmpty {
-            comps.queryItems = query.map { URLQueryItem(name: $0.key, value: $0.value) }
+        if !queryItems.isEmpty {
+            comps.queryItems = queryItems.map { URLQueryItem(name: $0.0, value: $0.1) }
         }
         guard let final = comps.url else { throw UgosError.transport("URL 构造失败") }
         return final
@@ -115,7 +120,21 @@ actor UgosClient {
         query: [String: String],
         body: Data?
     ) throws -> URLRequest {
-        var req = URLRequest(url: try url(path, query: query))
+        try makeRequest(
+            path: path,
+            method: method,
+            queryItems: query.map { ($0.key, $0.value) },
+            body: body
+        )
+    }
+
+    private func makeRequest(
+        path: String,
+        method: String,
+        queryItems: [(String, String)],
+        body: Data?
+    ) throws -> URLRequest {
+        var req = URLRequest(url: try url(path, queryItems: queryItems))
         req.httpMethod = method
         for (k, v) in Self.agentHeaders {
             req.setValue(v, forHTTPHeaderField: k)
@@ -238,6 +257,11 @@ actor UgosClient {
         try await perform(path: path, method: "GET", params: params, body: nil)
     }
 
+    /// GET，允许同名参数重复（日志筛选的 level / module 都是可重复参数）。
+    func getMulti(_ path: String, pairs: [(String, String)]) async throws -> Any {
+        try await perform(path: path, method: "GET", queryItems: pairs, body: nil)
+    }
+
     /// POST，token 同样走 query（实测 header 方式多返回 9404）。
     /// params 用于少数既需要 body 又需要 query 的接口，默认空。
     func post(
@@ -294,11 +318,27 @@ actor UgosClient {
         body: Data?,
         allowRetry: Bool = true
     ) async throws -> Any {
+        try await perform(
+            path: path,
+            method: method,
+            queryItems: params.map { ($0.key, $0.value) },
+            body: body,
+            allowRetry: allowRetry
+        )
+    }
+
+    private func perform(
+        path: String,
+        method: String,
+        queryItems: [(String, String)],
+        body: Data?,
+        allowRetry: Bool = true
+    ) async throws -> Any {
         if token.isEmpty { try await relogin() }
 
-        var query = params
-        query["token"] = token
-        let request = try makeRequest(path: path, method: method, query: query, body: body)
+        var query = queryItems
+        query.append(("token", token))
+        let request = try makeRequest(path: path, method: method, queryItems: query, body: body)
         let (http, data) = try await rawExecute(request)
 
         // 业务错误通常仍是 200，但 400/401 也要能读到 JSON 细节
@@ -319,7 +359,13 @@ actor UgosClient {
 
         if allowRetry, error.requiresRelogin {
             try await relogin()
-            return try await perform(path: path, method: method, params: params, body: body, allowRetry: false)
+            return try await perform(
+                path: path,
+                method: method,
+                queryItems: queryItems,
+                body: body,
+                allowRetry: false
+            )
         }
         throw error
     }

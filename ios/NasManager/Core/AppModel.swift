@@ -78,6 +78,11 @@ final class AppModel {
     private var imageService: ImageService?
     private var snapshotService: SnapshotService?
     private var firmwareService: FirmwareService?
+    private var logService: LogService?
+    private var sessionService: SessionService?
+    private var fanService: FanService?
+    private var backupService: BackupService?
+    private var powerPlanService: PowerPlanService?
     private var pollTask: Task<Void, Never>?
     private var evaluator = AlertEvaluator()
     private var activeHost: String?
@@ -189,6 +194,11 @@ final class AppModel {
         imageService = ImageService(client: newClient)
         snapshotService = SnapshotService(client: newClient)
         firmwareService = FirmwareService(client: newClient)
+        logService = LogService(client: newClient)
+        sessionService = SessionService(client: newClient)
+        fanService = FanService(client: newClient)
+        backupService = BackupService(client: newClient)
+        powerPlanService = PowerPlanService(client: newClient)
         activeLabel = candidate.label
         activeDisplay = endpoint.displayName
         activeHost = endpoint.host
@@ -223,6 +233,11 @@ final class AppModel {
         imageService = nil
         snapshotService = nil
         firmwareService = nil
+        logService = nil
+        sessionService = nil
+        fanService = nil
+        backupService = nil
+        powerPlanService = nil
         dashboard = nil
         lastUpdated = nil
         activeLabel = nil
@@ -361,6 +376,11 @@ final class AppModel {
             imageService = ImageService(client: newClient)
             snapshotService = SnapshotService(client: newClient)
             firmwareService = FirmwareService(client: newClient)
+            logService = LogService(client: newClient)
+            sessionService = SessionService(client: newClient)
+            fanService = FanService(client: newClient)
+            backupService = BackupService(client: newClient)
+            powerPlanService = PowerPlanService(client: newClient)
             activeLabel = alternate.label
             activeDisplay = alternate.endpoint.displayName
             activeHost = alternate.endpoint.host
@@ -499,6 +519,67 @@ final class AppModel {
     func rollbackSnapshot(_ item: SnapshotItem) async throws {
         guard let snapshotService = snapshotService else { throw UgosError.auth("尚未连接") }
         try await snapshotService.restore(item)
+    }
+
+    // MARK: 运维工具（只读）
+
+    @MainActor
+    func logModules() async -> [String] {
+        guard let logService = logService else { return [] }
+        return await logService.modules()
+    }
+
+    @MainActor
+    func logs(
+        page: Int,
+        levels: [String],
+        module: String?,
+        keyword: String
+    ) async -> LogQueryResult {
+        guard let logService = logService else {
+            return LogQueryResult(entries: [], total: nil, available: false, message: "尚未连接")
+        }
+        return await logService.query(page: page, levels: levels, module: module, keyword: keyword)
+    }
+
+    @MainActor
+    func onlineSessions() async -> SessionQueryResult {
+        guard let sessionService = sessionService else {
+            return SessionQueryResult(sessions: [], total: nil, available: false, message: "尚未连接")
+        }
+        return await sessionService.sessions()
+    }
+
+    @MainActor
+    func loginAudit() async -> LoginAuditResult {
+        guard let sessionService = sessionService else {
+            return LoginAuditResult(records: [], total: nil, available: false, message: "尚未连接")
+        }
+        return await sessionService.loginAudit()
+    }
+
+    @MainActor
+    func fanSnapshot() async -> FanSnapshot {
+        guard let fanService = fanService else {
+            return FanSnapshot(message: "尚未连接，请先连接 NAS")
+        }
+        return await fanService.snapshot()
+    }
+
+    @MainActor
+    func backupTasks() async -> BackupQueryResult {
+        guard let backupService = backupService else {
+            return BackupQueryResult(available: false, message: "尚未连接，请先连接 NAS")
+        }
+        return await backupService.tasks()
+    }
+
+    @MainActor
+    func powerPlan() async -> PowerPlanResult {
+        guard let powerPlanService = powerPlanService else {
+            return PowerPlanResult(available: false, message: "尚未连接，请先连接 NAS")
+        }
+        return await powerPlanService.plan()
     }
 
     // MARK: 固件
