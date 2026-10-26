@@ -1,12 +1,15 @@
 import SwiftUI
 
-/// 根视图：未连接时进入连接页，连上后是五页 TabView
+/// 根视图：锁定时是解锁页，未连接时进入连接页，连上后是五页 TabView
 struct RootView: View {
     @State private var model = AppModel()
+    @Environment(\.scenePhase) private var scenePhase
 
     var body: some View {
         Group {
-            if model.isReady {
+            if model.isLocked {
+                LockView(model: model)
+            } else if model.isReady {
                 mainTabs
             } else {
                 ConnectView(model: model)
@@ -29,6 +32,12 @@ struct RootView: View {
         .task {
             let granted = await AlertNotifier.shared.requestAuthorization()
             model.notificationDenied = !granted
+        }
+        .onChange(of: scenePhase) { _, phase in
+            // 回到前台时按需上锁（lockIfNeeded 内部有 30 秒宽限）
+            if phase == .active {
+                model.lockIfNeeded()
+            }
         }
     }
 

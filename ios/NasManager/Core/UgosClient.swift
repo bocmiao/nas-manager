@@ -35,11 +35,14 @@ struct UgosEndpoint: Hashable, Codable {
     var host: String
     var port: Int
 
+    /// IPv6 字面量必须包方括号才不会被当成 host:port
+    var urlHost: String { EndpointResolver.bracketIfNeeded(host) }
+
     var baseURL: URL? {
-        URL(string: "https://\(host):\(port)")
+        URL(string: "https://\(urlHost):\(port)")
     }
 
-    var displayName: String { "\(host):\(port)" }
+    var displayName: String { "\(urlHost):\(port)" }
 }
 
 // MARK: - 客户端

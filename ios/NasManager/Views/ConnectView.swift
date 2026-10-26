@@ -7,6 +7,14 @@ struct ConnectView: View {
     var body: some View {
         NavigationStack {
             Form {
+                if let profile = model.profiles.active {
+                    Section {
+                        InfoRow(title: "当前服务器", value: profile.displayName)
+                    } footer: {
+                        Text("在设置页可以新增、切换多台 NAS 配置。")
+                    }
+                }
+
                 Section {
                     TextField("内网地址，如 192.0.2.10", text: $model.internalHost)
                         .textInputAutocapitalization(.never)
@@ -18,10 +26,14 @@ struct ConnectView: View {
                         .keyboardType(.URL)
                     TextField("端口", text: $model.port)
                         .keyboardType(.numberPad)
+
+                    if let preview = EndpointResolver.previewURL(host: model.internalHost, port: model.port) {
+                        InfoRow(title: "解析为", value: preview)
+                    }
                 } header: {
                     Text("NAS 地址")
                 } footer: {
-                    Text("内网优先，探测不通时自动切到公网地址。端口默认 9443。")
+                    Text("内网优先，探测不通时自动切到公网地址。端口默认 9443。IPv6 可直接粘贴 2001:db8::1 或 [2001:db8::1]:9443，会自动补方括号。")
                 }
 
                 Section {

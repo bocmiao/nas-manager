@@ -15,6 +15,8 @@ enum SettingsKeys {
     static let refreshInterval = "nas.refreshInterval"
     static let activeAddress = "nas.activeAddress"
     static let passwordAccount = "nas.password"
+    /// 启动时是否要求 Face ID / Touch ID
+    static let biometricEnabled = "nas.biometricEnabled"
 }
 
 /// 证书指纹变化提示
@@ -39,6 +41,17 @@ final class AppModel {
     var rememberPassword: Bool
     /// 轮询间隔（秒），0 表示关闭
     var refreshInterval: Double
+
+    /// 多台 NAS 配置
+    let profiles: ProfileStore
+    /// 启动时校验身份
+    var biometricEnabled: Bool
+    /// 已上锁：界面只显示解锁页
+    var isLocked = false
+    /// 解锁页上的提示（降级原因 / 重试原因）
+    var lockMessage: String?
+    /// 服务器配置操作的结果提示
+    var profileNotice: String?
 
     // 运行状态
     var isConnecting = false
@@ -71,6 +84,9 @@ final class AppModel {
     private var consecutiveFailures = 0
     private var lastSwitchAttempt = Date.distantPast
     private var lastFirmwareCheck = Date.distantPast
+    private var biometricFailures = 0
+    /// 上次通过验证的时间，用于避免频繁切前后台就被反复要求验证
+    private var lastUnlockAt = Date.distantPast
 
     /// 最近一次拉到的可快照文件夹，创建快照时作为目标候选
     var snapshotFolders: [SnapshotFolder] = []
@@ -95,6 +111,25 @@ final class AppModel {
         password = remember
             ? (KeychainStore.load(account: SettingsKeys.passwordAccount) ?? "")
             : ""
+
+        // ProfileStore 内部会做旧配置迁移，必须放在上面读完旧键之后：
+        // 迁移会把 SettingsKeys 里的地址搬进 profile，并清掉共享的旧密码 account。
+        let store = ProfileStore()
+        profiles = store
+        biometricEnabled = defaults.bool(forKey: SettingsKeys.biometricEnabled)
+
+        // 有选中配置时以配置为准覆盖上面读到的旧值
+        if let active = store.active {
+            internalHost = active.internalHost
+            publicHost = active.publicHost
+            port = active.port
+            username = active.username
+            rememberPassword = active.rememberPassword
+            password = active.rememberPassword ? store.loadPassword(for: active.id) : ""
+        }
+
+        // 冷启动就上锁，避免先闪一帧连接页；没有保存密码则照常走手输流程
+        isLocked = biometricEnabled && rememberPassword && !password.isEmpty
     }
 
     var isReady: Bool { dashboard != nil }
@@ -103,6 +138,9 @@ final class AppModel {
 
     @MainActor
     func connect() async {
+        // 上锁状态不允许建连，必须先通过身份验证
+        guard !isLocked else { return }
+
         errorMessage = nil
         certificateWarning = nil
 
@@ -110,6 +148,8 @@ final class AppModel {
             errorMessage = "端口不合法"
             return
         }
+        // 把粘贴进来的 URL / 带方括号的 IPv6 整理成规范主机
+        normalizeAddressFields(defaultPort: portValue)
         let candidates = buildCandidates(port: portValue)
         guard !candidates.isEmpty else {
             errorMessage = "请至少填写内网或公网地址"
@@ -530,6 +570,9 @@ final class AppModel {
 
     @MainActor
     func saveSettings() {
+        // 先同步进当前配置，再写一份旧键做兜底（万一配置 JSON 损坏还能靠它恢复）
+        syncActiveProfile()
+
         let defaults = UserDefaults.standard
         defaults.set(internalHost.trimmingCharacters(in: .whitespacesAndNewlines), forKey: SettingsKeys.internalHost)
         defaults.set(publicHost.trimmingCharacters(in: .whitespacesAndNewlines), forKey: SettingsKeys.publicHost)
@@ -537,11 +580,23 @@ final class AppModel {
         defaults.set(username.trimmingCharacters(in: .whitespacesAndNewlines), forKey: SettingsKeys.username)
         defaults.set(rememberPassword, forKey: SettingsKeys.rememberPassword)
         defaults.set(refreshInterval, forKey: SettingsKeys.refreshInterval)
+    }
+
+    /// 把编辑中的地址 / 账号写回当前配置，密码按配置 id 存 Keychain
+    @MainActor
+    private func syncActiveProfile() {
+        guard var active = profiles.active else { return }
+        active.internalHost = internalHost.trimmingCharacters(in: .whitespacesAndNewlines)
+        active.publicHost = publicHost.trimmingCharacters(in: .whitespacesAndNewlines)
+        active.port = port.trimmingCharacters(in: .whitespacesAndNewlines)
+        active.username = username.trimmingCharacters(in: .whitespacesAndNewlines)
+        active.rememberPassword = rememberPassword
+        profiles.update(active)
 
         if rememberPassword, !password.isEmpty {
-            KeychainStore.save(password, account: SettingsKeys.passwordAccount)
+            profiles.savePassword(password, for: active.id)
         } else if !rememberPassword {
-            KeychainStore.delete(account: SettingsKeys.passwordAccount)
+            profiles.deletePassword(for: active.id)
         }
     }
 
@@ -559,21 +614,171 @@ final class AppModel {
         KeychainStore.deleteAll()
         password = ""
         rememberPassword = false
+        profiles.clearRememberFlags()
         UserDefaults.standard.set(false, forKey: SettingsKeys.rememberPassword)
+    }
+
+    // MARK: 多配置
+
+    var serverProfiles: [ServerProfile] { profiles.profiles }
+    var activeProfileID: UUID? { profiles.activeID }
+
+    /// 用当前配置覆盖编辑字段与密码
+    @MainActor
+    func applyActiveProfile() {
+        guard let active = profiles.active else { return }
+        internalHost = active.internalHost
+        publicHost = active.publicHost
+        port = active.port
+        username = active.username
+        rememberPassword = active.rememberPassword
+        password = active.rememberPassword ? profiles.loadPassword(for: active.id) : ""
+    }
+
+    /// 切换配置：先断开旧连接，再用新配置重建 client 并重连
+    @MainActor
+    func switchProfile(to id: UUID) async {
+        guard id != profiles.activeID, profiles.profile(id: id) != nil else { return }
+        profileNotice = nil
+        disconnect()
+        profiles.select(id)
+        applyActiveProfile()
+        await connect()
+    }
+
+    /// 新增或更新一条配置；改的是当前配置时同步回编辑字段
+    @MainActor
+    func saveProfile(_ profile: ServerProfile) {
+        if profiles.profile(id: profile.id) != nil {
+            profiles.update(profile)
+        } else {
+            profiles.add(profile)
+        }
+        if profile.id == profiles.activeID {
+            applyActiveProfile()
+        }
+        profileNotice = nil
+    }
+
+    /// 删除配置。当前使用中的那条会被拒绝并给出提示。
+    @MainActor
+    @discardableResult
+    func deleteProfile(id: UUID) -> Bool {
+        if let message = profiles.delete(id: id) {
+            profileNotice = message
+            return false
+        }
+        profileNotice = nil
+        return true
+    }
+
+    // MARK: 生物识别解锁
+
+    /// 是否具备「启动验证」的条件：开关已开、且确实记住了密码
+    var canLockWithBiometrics: Bool {
+        biometricEnabled && rememberPassword && !password.isEmpty
+    }
+
+    @MainActor
+    func setBiometricEnabled(_ enabled: Bool) {
+        guard enabled == false || BiometricLock.isAvailable() else {
+            biometricEnabled = false
+            return
+        }
+        biometricEnabled = enabled
+        UserDefaults.standard.set(enabled, forKey: SettingsKeys.biometricEnabled)
+        if !enabled {
+            isLocked = false
+            lockMessage = nil
+        }
+    }
+
+    /// 冷启动与回前台时按需上锁。没有保存密码时保持原有手输流程，避免把用户关在门外。
+    /// 只读写自身状态，调用方都在主线程（视图的 task / onChange），因此不标 @MainActor。
+    func lockIfNeeded() {
+        guard canLockWithBiometrics else { return }
+        // 刚验证过 30 秒内不算重新进入，避免下拉一下通知中心就要再验一次
+        guard Date().timeIntervalSince(lastUnlockAt) > 30 else { return }
+        isLocked = true
+        lockMessage = nil
+        biometricFailures = 0
+    }
+
+    @MainActor
+    func unlockWithBiometrics() async {
+        guard isLocked else { return }
+        let result = await BiometricLock.authenticate(reason: "验证身份后连接 NAS")
+
+        switch result {
+        case .success:
+            isLocked = false
+            lockMessage = nil
+            biometricFailures = 0
+            lastUnlockAt = Date()
+            if !isReady {
+                await connect()
+            }
+        case .cancelled:
+            // 用户取消：停留解锁页，不降级
+            lockMessage = nil
+        case .unavailable(let message):
+            fallbackToPassword(message: message)
+        case .failed(let message):
+            biometricFailures += 1
+            if biometricFailures >= 2 {
+                fallbackToPassword(message: "多次验证未通过，请改用密码")
+            } else {
+                lockMessage = message
+            }
+        }
+    }
+
+    /// 降级为手输密码：解除锁定、清空内存中的密码，让用户重新输入
+    @MainActor
+    func fallbackToPassword(message: String? = nil) {
+        isLocked = false
+        lockMessage = nil
+        biometricFailures = 0
+        password = ""
+        errorMessage = message
     }
 
     // MARK: 地址处理
 
-    private func buildCandidates(port: Int) -> [AddressCandidate] {
-        let internalValue = normalizedHost(internalHost)
-        let publicValue = normalizedHost(publicHost)
-
-        var list: [AddressCandidate] = []
-        if !internalValue.isEmpty {
-            list.append(AddressCandidate(endpoint: UgosEndpoint(host: internalValue, port: port), label: "内网"))
+    /// 连接前把输入框整理成规范主机（IPv6 去掉方括号、去掉协议与路径），
+    /// 顺带把结果显示回输入框，用户能看到最终用的是哪个地址。
+    @MainActor
+    private func normalizeAddressFields(defaultPort: Int) {
+        if let value = EndpointResolver.normalize(host: internalHost, port: port, defaultPort: defaultPort) {
+            internalHost = value.host
         }
-        if !publicValue.isEmpty, publicValue != internalValue {
-            list.append(AddressCandidate(endpoint: UgosEndpoint(host: publicValue, port: port), label: "公网"))
+        if let value = EndpointResolver.normalize(host: publicHost, port: port, defaultPort: defaultPort) {
+            publicHost = value.host
+        }
+    }
+
+    private func buildCandidates(port portValue: Int) -> [AddressCandidate] {
+        var list: [AddressCandidate] = []
+        var seen: Set<String> = []
+
+        for (raw, label) in [(internalHost, "内网"), (publicHost, "公网")] {
+            guard let address = EndpointResolver.normalize(
+                host: raw,
+                port: String(portValue),
+                defaultPort: portValue
+            ) else { continue }
+
+            // 内外网填成同一个地址时只探测一次
+            let key = "\(address.host.lowercased()):\(address.port)"
+            guard !seen.contains(key) else { continue }
+            seen.insert(key)
+
+            list.append(
+                AddressCandidate(
+                    endpoint: UgosEndpoint(host: address.host, port: address.port),
+                    label: label
+                )
+            )
         }
 
         // 上次连上的是公网就优先公网，减少一次无效探测
@@ -582,26 +787,6 @@ final class AppModel {
             list.reverse()
         }
         return list
-    }
-
-    /// 容忍用户粘贴 "https://host:9443/" 这类写法
-    private func normalizedHost(_ raw: String) -> String {
-        var host = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !host.isEmpty else { return "" }
-
-        if let range = host.range(of: "://") {
-            host = String(host[range.upperBound...])
-        }
-        if let slash = host.firstIndex(of: "/") {
-            host = String(host[..<slash])
-        }
-        if let colon = host.lastIndex(of: ":"), !host.hasSuffix("]") {
-            let suffix = String(host[host.index(after: colon)...])
-            if !suffix.isEmpty, suffix.allSatisfy({ $0.isNumber }) {
-                host = String(host[..<colon])
-            }
-        }
-        return host
     }
 
     private func takeCertificateWarning(for endpoint: UgosEndpoint) -> CertificateWarning? {

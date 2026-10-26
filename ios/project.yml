@@ -36,6 +36,8 @@ targets:
           NSAllowsArbitraryLoads: true
           NSAllowsLocalNetworking: true
         NSLocalNetworkUsageDescription: 需要访问局域网内的 NAS 设备
+        # Face ID 必须声明用途，否则调用 LocalAuthentication 会直接终止进程
+        NSFaceIDUsageDescription: 用 Face ID 解锁已保存在本机的 NAS 密码
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: dev.nasmanager.app

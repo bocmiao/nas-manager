@@ -1,21 +1,20 @@
 import SwiftUI
 
-/// 设置页：地址 / 账号 / 刷新 / 安全
+/// 设置页：服务器 / 安全 / 数据刷新 / 关于
 struct SettingsView: View {
     @Bindable var model: AppModel
 
     @State private var showingClearKeychain = false
     @State private var showingResetPins = false
+    @State private var biometryAvailable = BiometricLock.isAvailable()
 
     var body: some View {
         NavigationStack {
             Form {
-                addressSection
-                accountSection
-                refreshSection
-                firmwareSection
-                statusSection
+                serverSection
                 securitySection
+                refreshSection
+                aboutSection
             }
             .navigationTitle("设置")
             .toolbar {
@@ -24,6 +23,9 @@ struct SettingsView: View {
                         model.saveSettings()
                     }
                 }
+            }
+            .onAppear {
+                biometryAvailable = BiometricLock.isAvailable()
             }
             .confirmationDialog(
                 "清空 Keychain 中的密码？",
@@ -52,10 +54,52 @@ struct SettingsView: View {
         }
     }
 
-    // MARK: 地址
+    // MARK: 服务器
 
     @ViewBuilder
-    private var addressSection: some View {
+    private var serverSection: some View {
+        Section {
+            // 配置列表：点一行即切换（当前项置灰）
+            ForEach(model.serverProfiles) { profile in
+                Button {
+                    Task { await model.switchProfile(to: profile.id) }
+                } label: {
+                    HStack {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(profile.displayName)
+                                .font(.subheadline)
+                                .foregroundStyle(.primary)
+                            Text(profile.addressSummary)
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                        Spacer(minLength: 8)
+                        if profile.id == model.activeProfileID {
+                            Image(systemName: "checkmark")
+                                .foregroundStyle(.tint)
+                        }
+                    }
+                }
+                .disabled(profile.id == model.activeProfileID || model.isConnecting)
+            }
+
+            NavigationLink {
+                ServerProfilesView(model: model)
+            } label: {
+                Label("管理服务器配置", systemImage: "server.rack")
+            }
+
+            if let notice = model.profileNotice {
+                Text(notice)
+                    .font(.footnote)
+                    .foregroundStyle(.orange)
+            }
+        } header: {
+            Text("服务器")
+        } footer: {
+            Text("切换服务器会先断开当前连接，再用新配置重新连接。当前使用中的配置不能删除。")
+        }
+
         Section {
             TextField("内网地址", text: $model.internalHost)
                 .textInputAutocapitalization(.never)
@@ -67,17 +111,16 @@ struct SettingsView: View {
                 .keyboardType(.URL)
             TextField("端口", text: $model.port)
                 .keyboardType(.numberPad)
+
+            if let preview = EndpointResolver.previewURL(host: model.internalHost, port: model.port) {
+                InfoRow(title: "解析为", value: preview)
+            }
         } header: {
-            Text("服务器地址")
+            Text("当前服务器地址")
         } footer: {
-            Text("每次连接先探测内网，超时后自动尝试公网。上次成功的地址会优先使用。")
+            Text("支持 IPv6：可直接粘贴 2001:db8::1 或 [2001:db8::1]:9443，拼 URL 时会自动补方括号。")
         }
-    }
 
-    // MARK: 账号
-
-    @ViewBuilder
-    private var accountSection: some View {
         Section {
             TextField("用户名", text: $model.username)
                 .textInputAutocapitalization(.never)
@@ -99,14 +142,80 @@ struct SettingsView: View {
                 }
             }
             .disabled(model.isConnecting)
+
+            Button(role: .destructive) {
+                model.disconnect()
+            } label: {
+                Text("断开连接")
+            }
         } header: {
             Text("账号")
         } footer: {
-            Text("密码只写入系统 Keychain，不会落到 UserDefaults。")
+            Text("密码只写入系统 Keychain，并按服务器分别保存（account 带配置 id），不会落到 UserDefaults。")
         }
     }
 
-    // MARK: 刷新
+    // MARK: 安全
+
+    @ViewBuilder
+    private var securitySection: some View {
+        Section {
+            Toggle(isOn: $model.biometricEnabled) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("启动时验证身份")
+                    Text(biometryAvailable
+                         ? "使用 \(BiometricLock.displayName()) 解锁已保存的密码"
+                         : "此设备不支持生物识别")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
+            // 设备不支持时不允许新开，但已经开着的要允许关掉，否则用户会被永远要求输密码
+            .disabled(!biometryAvailable && !model.biometricEnabled)
+            .onChange(of: model.biometricEnabled) { _, enabled in
+                model.setBiometricEnabled(enabled)
+            }
+
+            if model.biometricEnabled && !model.canLockWithBiometrics {
+                Text("还需要勾选「记住密码」并成功连接一次，下次启动才会要求验证。")
+                    .font(.footnote)
+                    .foregroundStyle(.orange)
+            }
+
+            let pins = CertificatePinStore.shared.allPins()
+            if pins.isEmpty {
+                EmptyHint(text: "还没有记录任何证书指纹")
+            } else {
+                ForEach(pins.keys.sorted(), id: \.self) { key in
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(key)
+                            .font(.caption)
+                        Text(shortFingerprint(pins[key] ?? ""))
+                            .font(.caption2.monospaced())
+                            .foregroundStyle(.secondary)
+                    }
+                }
+            }
+
+            Button {
+                showingResetPins = true
+            } label: {
+                Text("清除证书指纹")
+            }
+
+            Button(role: .destructive) {
+                showingClearKeychain = true
+            } label: {
+                Text("清空 Keychain 密码")
+            }
+        } header: {
+            Text("安全")
+        } footer: {
+            Text("首次连接记录服务器证书 SHA-256 指纹（TOFU）；指纹变化时会中断连接并提示确认。生物识别不可用或多次失败时会自动回落到手输密码。")
+        }
+    }
+
+    // MARK: 数据刷新
 
     @ViewBuilder
     private var refreshSection: some View {
@@ -121,18 +230,7 @@ struct SettingsView: View {
             .onChange(of: model.refreshInterval) { _, _ in
                 model.applyRefreshInterval()
             }
-        } header: {
-            Text("刷新")
-        } footer: {
-            Text("前台轮询间隔。间隔越短越及时，也越费电。")
-        }
-    }
 
-    // MARK: 固件
-
-    @ViewBuilder
-    private var firmwareSection: some View {
-        Section {
             InfoRow(
                 title: "当前版本",
                 value: model.firmware?.currentVersion
@@ -167,68 +265,34 @@ struct SettingsView: View {
             }
             .disabled(model.isCheckingFirmware)
         } header: {
-            Text("固件")
+            Text("数据刷新")
         } footer: {
-            Text("只做版本提醒，升级请到 UGOS 网页端操作。")
+            Text("前台轮询间隔，间隔越短越及时也越费电。固件只做版本提醒，升级请到 UGOS 网页端操作。")
         }
     }
 
-    // MARK: 状态
+    // MARK: 关于
 
     @ViewBuilder
-    private var statusSection: some View {
+    private var aboutSection: some View {
         Section {
             InfoRow(title: "接入方式", value: model.activeLabel ?? "-")
             InfoRow(title: "当前地址", value: model.activeDisplay)
             InfoRow(title: "上次更新", value: Format.timestamp(model.lastUpdated))
             InfoRow(title: "未读告警", value: "\(model.alerts.unreadCount) 条")
-
-            Button(role: .destructive) {
-                model.disconnect()
-            } label: {
-                Text("断开连接")
-            }
+            InfoRow(title: "应用版本", value: appVersion)
         } header: {
-            Text("连接状态")
+            Text("关于")
+        } footer: {
+            Text("支持 Siri 快捷指令「查询 NAS 状态 / 查看告警 / 查询存储」，读取的是最近一次同步的快照，需先打开应用同步。")
         }
     }
 
-    // MARK: 安全
-
-    @ViewBuilder
-    private var securitySection: some View {
-        Section {
-            let pins = CertificatePinStore.shared.allPins()
-            if pins.isEmpty {
-                EmptyHint(text: "还没有记录任何证书指纹")
-            } else {
-                ForEach(pins.keys.sorted(), id: \.self) { key in
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text(key)
-                            .font(.caption)
-                        Text(shortFingerprint(pins[key] ?? ""))
-                            .font(.caption2.monospaced())
-                            .foregroundStyle(.secondary)
-                    }
-                }
-            }
-
-            Button {
-                showingResetPins = true
-            } label: {
-                Text("清除证书指纹")
-            }
-
-            Button(role: .destructive) {
-                showingClearKeychain = true
-            } label: {
-                Text("清空 Keychain 密码")
-            }
-        } header: {
-            Text("安全（TOFU 证书指纹）")
-        } footer: {
-            Text("首次连接记录服务器证书 SHA-256 指纹；指纹变化时会中断连接并提示确认。")
-        }
+    private var appVersion: String {
+        let info = Bundle.main.infoDictionary
+        let version = info?["CFBundleShortVersionString"] as? String ?? "0"
+        let build = info?["CFBundleVersion"] as? String ?? "0"
+        return "\(version) (\(build))"
     }
 
     private func shortFingerprint(_ value: String) -> String {
