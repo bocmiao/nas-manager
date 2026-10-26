@@ -10,6 +10,7 @@ struct OverviewView: View {
     @AppStorage("firmware.dismissedVersion") private var dismissedFirmwareVersion = ""
     /// 曲线时间范围（采样点数）
     @State private var historyRange = 120
+    @State private var showingAlerts = false
 
     var body: some View {
         NavigationStack {
@@ -52,7 +53,42 @@ struct OverviewView: View {
                     ProgressView("读取中…")
                 }
             }
+            .toolbar {
+                ToolbarItem(placement: .topBarTrailing) {
+                    alertsButton
+                }
+            }
+            .sheet(isPresented: $showingAlerts) {
+                AlertsView(model: model)
+            }
         }
+    }
+
+    /// 告警入口。原来是一级 Tab，本轮把 Tab 位让给了文件管理——
+    /// 告警本身还是高频，所以钉在总览工具栏，未读数照旧显示在角标上。
+    private var alertsButton: some View {
+        Button {
+            showingAlerts = true
+        } label: {
+            ZStack(alignment: .topTrailing) {
+                Image(systemName: "bell")
+                if model.alerts.unreadCount > 0 {
+                    Text("\(model.alerts.unreadCount)")
+                        .font(.system(size: 10, weight: .bold))
+                        .foregroundStyle(.white)
+                        .padding(.horizontal, 4)
+                        .padding(.vertical, 1)
+                        .background(Color.red, in: Capsule())
+                        .offset(x: 9, y: -7)
+                }
+            }
+            .frame(width: 24, height: 20)
+        }
+        .accessibilityLabel(
+            model.alerts.unreadCount > 0
+                ? "告警，\(model.alerts.unreadCount) 条未读"
+                : "告警"
+        )
     }
 
     private var title: String {

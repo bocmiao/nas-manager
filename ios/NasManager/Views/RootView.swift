@@ -1,6 +1,7 @@
 import SwiftUI
 
 /// 根视图：锁定时是解锁页，未连接时进入连接页，连上后是五页 TabView
+/// （总览 / 文件 / 容器 / 存储 / 设置；告警在总览页工具栏）
 struct RootView: View {
     @State private var model = AppModel()
     @Environment(\.scenePhase) private var scenePhase
@@ -46,15 +47,20 @@ struct RootView: View {
             OverviewView(model: model)
                 .tabItem { Label("总览", systemImage: "gauge") }
 
+            // 文件管理是这 App 里功能最厚的一块（上传下载 / 复制移动 / 压缩解压 /
+            // 缩略图预览），之前藏在「设置 → 运维工具」三层，现在提到一级。
+            // 为了不撑出第 6 个 Tab（iOS 会把后两个折进「更多」），
+            // 告警改成总览页工具栏的铃铛入口。
+            NavigationStack {
+                FilesView(model: model)
+            }
+            .tabItem { Label("文件", systemImage: "folder") }
+
             ContainersView(model: model)
                 .tabItem { Label("容器", systemImage: "shippingbox") }
 
             StorageView(model: model)
                 .tabItem { Label("存储", systemImage: "internaldrive") }
-
-            AlertsView(model: model)
-                .tabItem { Label("告警", systemImage: "bell") }
-                .badge(model.alerts.unreadCount)
 
             SettingsView(model: model)
                 .tabItem { Label("设置", systemImage: "gearshape") }

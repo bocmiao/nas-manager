@@ -9,7 +9,6 @@ struct StorageView: View {
     var body: some View {
         NavigationStack {
             List {
-                browseSection
                 poolSection
                 volumeSection
                 snapshotSection
@@ -28,30 +27,6 @@ struct StorageView: View {
             .refreshable { await model.refresh() }
             .sheet(item: $smartTarget) { disk in
                 DiskSMARTSheet(model: model, disk: disk)
-            }
-        }
-    }
-
-    // MARK: 浏览文件
-
-    /// 文件管理器藏在「设置 → 运维工具」里太深了，存储页给个直接入口。
-    /// 上传 / 下载 / 复制移动 / 压缩解压 / 缩略图预览都在那一页。
-    @ViewBuilder
-    private var browseSection: some View {
-        Section {
-            NavigationLink {
-                FilesView(model: model)
-            } label: {
-                Label {
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text("浏览文件")
-                        Text("上传 / 下载 / 复制移动 / 压缩解压 / 图片预览")
-                            .font(.caption2)
-                            .foregroundStyle(.secondary)
-                    }
-                } icon: {
-                    Image(systemName: "folder")
-                }
             }
         }
     }
