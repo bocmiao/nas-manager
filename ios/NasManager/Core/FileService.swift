@@ -364,6 +364,39 @@ struct FileDeleteResult: Decodable, Hashable {
     var forever: Bool
 }
 
+/// 目录体积。
+///
+/// 两个坑：**必须带 `intranet_share_id`（传 0 即可）**，否则 NAS 回的数字全是 0，
+/// 看着像空目录其实是没算；而且**计算是增量的**，连续采样数字会一路涨，
+/// 没有「算完了」标志。
+struct FileFolderSize: Decodable, Hashable {
+    let size: UInt64
+    let takesSpace: UInt64
+    let fileCount: Int
+    let dirCount: Int
+    let calculateID: String
+
+    var sizeText: String { Format.bytes(size) }
+    var takesSpaceText: String { Format.bytes(takesSpace) }
+
+    enum CodingKeys: String, CodingKey {
+        case size
+        case takesSpace = "takes_space"
+        case fileCount = "file_count"
+        case dirCount = "dir_count"
+        case calculateID = "calculate_id"
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        size = Lenient.uint64(c, .size) ?? 0
+        takesSpace = Lenient.uint64(c, .takesSpace) ?? 0
+        fileCount = Lenient.int(c, .fileCount) ?? 0
+        dirCount = Lenient.int(c, .dirCount) ?? 0
+        calculateID = Lenient.string(c, .calculateID) ?? ""
+    }
+}
+
 /// 压缩 / 解压任务。
 ///
 /// 两个接口都返回 `{result: "<uuid>"}` —— 又是**异步任务**，而且同样没有进度接口。
@@ -893,6 +926,46 @@ final class FileService {
             "v2/filemgr/delPaths", json: ["paths": cleaned, "forever": forever]
         )
         return FileDeleteResult(deleted: cleaned, forever: forever)
+    }
+
+    // MARK: 文件夹体积
+
+    /// 取目录体积。
+    ///
+    /// `intranet_share_id` **必须带**（0 就行）：只传 path 时 NAS 返回全 0，
+    /// 看起来像空目录，实际是没触发计算。
+    func folderSize(path: String, intranetShareID: Int = 0) async throws -> FileFolderSize {
+        guard path.hasPrefix("/") else { throw UgosError.auth("目录路径必须是绝对路径") }
+        return try await client.getDecodable(
+            FileFolderSize.self,
+            path: "v2/filemgr/getSizeAndCount",
+            params: [
+                "path": path,
+                "intranet_share_id": String(intranetShareID)
+            ]
+        )
+    }
+
+    /// 采样到稳定为止。
+    ///
+    /// NAS 侧是增量扫描，没有完成标志，所以这里连续取，数字不再变化就算稳定。
+    /// 返回最后一次采样，外加「是否还在涨」。
+    func measureFolder(
+        path: String,
+        attempts: Int = 6,
+        interval: TimeInterval = 1.0
+    ) async throws -> (size: FileFolderSize, settled: Bool) {
+        var last = try await folderSize(path: path)
+        for _ in 1..<max(1, attempts) {
+            try? await Task.sleep(nanoseconds: UInt64(interval * 1_000_000_000))
+            let next = try await folderSize(path: path)
+            if next.size == last.size, next.fileCount == last.fileCount,
+               next.dirCount == last.dirCount {
+                return (next, true)
+            }
+            last = next
+        }
+        return (last, false)
     }
 
     // MARK: 压缩 / 解压

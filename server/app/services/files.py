@@ -427,6 +427,38 @@ class FileService:
             raise FileRejected("预览返回空内容")
         return data, ctype
 
+    # MARK: 文件夹体积
+
+    async def folder_size(self, path: str, intranet_share_id: int = 0) -> dict:
+        """文件夹体积与文件数（`GET v2/filemgr/getSizeAndCount`）。
+
+        实测四个要点：
+        1. **必须带 `intranet_share_id`（传 0 就行）**。只传 `path` 也会返回，
+           但所有数字都是 0 —— 看着像「空文件夹」，其实是没真算。
+        2. 只认单个 `path`；传 `paths` 数组形状回 `9999 操作失败!`。
+        3. 返回 `{size, takes_space, file_count, dir_count, hide_count,
+           hideDir_count, status, calculate_id, is_show}`。
+           `size` 是逻辑大小，`takes_space` 是实际占用（含块对齐）。
+        4. **计算是增量的**：同一目录连续调用，数字一路涨。
+           没有明确的「算完了」标志（`status` 一直是 0），
+           所以调用方只能连续采样到数字稳定。
+        """
+        clean = sanitize_path(path)
+        raw = await self._c.get("v2/filemgr/getSizeAndCount", {
+            "path": clean,
+            "intranet_share_id": int(intranet_share_id or 0),
+        }) or {}
+        return {
+            "path": clean,
+            "size": int(raw.get("size") or 0),
+            "takes_space": int(raw.get("takes_space") or 0),
+            "file_count": int(raw.get("file_count") or 0),
+            "dir_count": int(raw.get("dir_count") or 0),
+            "hide_count": int(raw.get("hide_count") or 0),
+            "status": int(raw.get("status") or 0),
+            "calculate_id": str(raw.get("calculate_id") or ""),
+        }
+
     # MARK: 压缩 / 解压
 
     async def compress(

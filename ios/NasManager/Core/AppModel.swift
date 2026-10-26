@@ -654,6 +654,18 @@ final class AppModel {
         }
     }
 
+    /// 目录体积。NAS 侧是增量扫描且没有完成标志，所以采样到稳定为止，
+    /// 返回最后一次结果 + 「是否还在涨」。
+    @MainActor
+    func fileFolderSize(path: String) async throws -> (size: FileFolderSize, settled: Bool) {
+        guard let fileService = fileService else { throw UgosError.auth("尚未连接") }
+        do {
+            return try await fileService.measureFolder(path: path)
+        } catch {
+            throw UgosError.auth(FileService.friendly(error))
+        }
+    }
+
     /// 压缩。返回后任务还在后台跑，要等落地调 `fileWaitArchive`。
     @MainActor
     func fileCompress(paths: [String], name: String) async throws -> FileArchiveResult {

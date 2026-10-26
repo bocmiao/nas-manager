@@ -28,6 +28,26 @@ private struct TransferRequest: Identifiable {
     let move: Bool
 }
 
+/// 文件页的所有弹层。
+///
+/// 之前是三个独立的 `.sheet(item:)` 挂在同一个视图上——SwiftUI 只保证
+/// 最后一个能稳定弹出，属于随时会翻车的写法。集中成一个 enum 后只挂一个 sheet。
+private enum FileSheet: Identifiable {
+    case share(SharedFile)
+    case preview(FileEntry)
+    case transfer(TransferRequest)
+    case info(FileEntry)
+
+    var id: String {
+        switch self {
+        case .share(let file): return "share-\(file.id.uuidString)"
+        case .preview(let entry): return "preview-\(entry.id)"
+        case .transfer(let request): return "transfer-\(request.id.uuidString)"
+        case .info(let entry): return "info-\(entry.id)"
+        }
+    }
+}
+
 /// 上传进度。多文件是顺序上传，这里只记「第几个 / 共几个 + 当前文件名」
 private struct FileUploadProgress {
     let index: Int
@@ -64,9 +84,9 @@ struct FilesView: View {
     @State private var pendingDelete: FileEntry?
     @State private var busyPath: String?
     @State private var actionError: String?
-    @State private var shared: SharedFile?
-    @State private var previewEntry: FileEntry?
-    @State private var pendingTransfer: TransferRequest?
+    /// 整个页面只挂**一个** sheet。多个 `.sheet` 挂在同一个视图上，
+    /// SwiftUI 只保证最后一个能稳定弹出，之前三个分开挂是隐患。
+    @State private var sheet: FileSheet?
     @State private var transferNote: String?
     @State private var passwordEntry: FileEntry?
     @State private var archivePassword = ""
@@ -189,20 +209,8 @@ struct FilesView: View {
         } message: {
             Text(uploadSummary ?? "")
         }
-        .sheet(item: $shared) { file in
-            shareSheet(file)
-        }
-        .sheet(item: $previewEntry) { entry in
-            ImagePreviewView(model: model, entry: entry)
-        }
-        .sheet(item: $pendingTransfer) { request in
-            DestinationPickerView(
-                model: model,
-                actionTitle: request.move ? "移动到这里" : "复制到这里",
-                blocked: Set(request.paths)
-            ) { destination in
-                Task { await performTransfer(request, to: destination) }
-            }
+        .sheet(item: $sheet) { item in
+            sheetContent(item)
         }
         .alert("操作结果", isPresented: transferNoteBinding) {
             Button("好", role: .cancel) { transferNote = nil }
@@ -497,13 +505,13 @@ struct FilesView: View {
         .swipeActions(edge: .leading) {
             if entry.isDeletable {
                 Button {
-                    pendingTransfer = TransferRequest(paths: [entry.path], move: false)
+                    sheet = .transfer(TransferRequest(paths: [entry.path], move: false))
                 } label: {
                     Label("复制", systemImage: "doc.on.doc")
                 }
                 .tint(.blue)
                 Button {
-                    pendingTransfer = TransferRequest(paths: [entry.path], move: true)
+                    sheet = .transfer(TransferRequest(paths: [entry.path], move: true))
                 } label: {
                     Label("移动", systemImage: "arrow.turn.down.right")
                 }
@@ -529,6 +537,11 @@ struct FilesView: View {
             }
         }
         .contextMenu {
+            Button {
+                sheet = .info(entry)
+            } label: {
+                Label("查看详情", systemImage: "info.circle")
+            }
             if entry.isDownloadable {
                 Button {
                     Task { await performDownload(entry) }
@@ -538,12 +551,12 @@ struct FilesView: View {
             }
             if entry.isDeletable {
                 Button {
-                    pendingTransfer = TransferRequest(paths: [entry.path], move: false)
+                    sheet = .transfer(TransferRequest(paths: [entry.path], move: false))
                 } label: {
                     Label("复制到…", systemImage: "doc.on.doc")
                 }
                 Button {
-                    pendingTransfer = TransferRequest(paths: [entry.path], move: true)
+                    sheet = .transfer(TransferRequest(paths: [entry.path], move: true))
                 } label: {
                     Label("移动到…", systemImage: "arrow.turn.down.right")
                 }
@@ -598,6 +611,26 @@ struct FilesView: View {
 
     // MARK: 分享面板
 
+    @ViewBuilder
+    private func sheetContent(_ item: FileSheet) -> some View {
+        switch item {
+        case .share(let file):
+            shareSheet(file)
+        case .preview(let entry):
+            ImagePreviewView(model: model, entry: entry)
+        case .transfer(let request):
+            DestinationPickerView(
+                model: model,
+                actionTitle: request.move ? "移动到这里" : "复制到这里",
+                blocked: Set(request.paths)
+            ) { destination in
+                Task { await performTransfer(request, to: destination) }
+            }
+        case .info(let entry):
+            FileInfoSheet(model: model, entry: entry)
+        }
+    }
+
     private func shareSheet(_ file: SharedFile) -> some View {
         NavigationStack {
             VStack(spacing: 16) {
@@ -622,7 +655,7 @@ struct FilesView: View {
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .topBarTrailing) {
-                    Button("完成") { shared = nil }
+                    Button("完成") { sheet = nil }
                 }
             }
         }
@@ -773,7 +806,7 @@ struct FilesView: View {
             actionError = "标签不是文件，不能下载"
         } else if FileService.supportsThumbnail(entry) {
             // 图片直接看，不用先下载到本地再分享
-            previewEntry = entry
+            sheet = .preview(entry)
         } else {
             Task { await performDownload(entry) }
         }
@@ -913,7 +946,7 @@ struct FilesView: View {
         do {
             let data = try await model.downloadFile(path: entry.path)
             let url = try writeTemporary(data: data, name: entry.name)
-            shared = SharedFile(url: url, name: entry.name)
+            sheet = .share(SharedFile(url: url, name: entry.name))
         } catch {
             actionError = error.localizedDescription
         }

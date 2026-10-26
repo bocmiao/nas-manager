@@ -1200,6 +1200,24 @@ async def files_transfer(
     return ok(result)
 
 
+@router.get("/files/size", dependencies=[Depends(require_auth)])
+async def files_size(
+    path: str = Query(..., description="目录绝对路径"),
+    intranet_share_id: int = Query(0),
+    files: FileService = Depends(get_files),
+):
+    """目录体积与文件数。
+
+    注意两点：必须带 `intranet_share_id`（传 0 即可），否则数字全是 0；
+    而且**计算是增量的**，连续调用数字会一路涨，
+    没有「算完了」标志，调用方只能采样到稳定。
+    """
+    try:
+        return ok(await files.folder_size(path, intranet_share_id=intranet_share_id))
+    except FileRejected as exc:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, detail=exc.msg) from exc
+
+
 @router.post("/files/compress", dependencies=[Depends(require_auth)])
 async def files_compress(
     paths: list[str] = Body(..., embed=True, description="要打包的绝对路径数组"),
