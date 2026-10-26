@@ -168,6 +168,20 @@ struct FileEntry: Decodable, Identifiable, Hashable {
     var isDeletionRecoverable: Bool { recycleOpen }
     var isRenamable: Bool { !isTag }
 
+    /// 是不是能解压的压缩包（后缀在 NAS 支持的范围内）
+    var canExtract: Bool {
+        guard !isDir, !isTag, let ext, !ext.isEmpty else { return false }
+        return FileService.archiveExts.contains(ext.lowercased())
+    }
+
+    /// 压缩时用的默认包名（文件名去后缀）
+    var archiveBaseName: String {
+        guard let ext, !ext.isEmpty, name.lowercased().hasSuffix(".\(ext.lowercased())") else {
+            return name
+        }
+        return String(name.dropLast(ext.count + 1))
+    }
+
     var sizeText: String { isDir ? "--" : Format.bytes(size) }
 
     var mtimeText: String {
@@ -348,6 +362,19 @@ struct FileSpace: Decodable, Hashable {
 struct FileDeleteResult: Decodable, Hashable {
     var deleted: [String]
     var forever: Bool
+}
+
+/// 压缩 / 解压任务。
+///
+/// 两个接口都返回 `{result: "<uuid>"}` —— 又是**异步任务**，而且同样没有进度接口。
+/// 实测几百字节的文件压缩 0.6 秒、解压 0.6 秒，所以轮询目标目录足够了。
+struct FileArchiveResult: Hashable {
+    let taskID: String
+    /// 压缩是输出目录，解压也是输出目录
+    let out: String
+    /// 压缩时的预期包名（`名字.zip`）；解压时为 nil，改看目录是否非空
+    let expectName: String?
+    let isExtract: Bool
 }
 
 /// 复制 / 移动的结果。
@@ -866,6 +893,124 @@ final class FileService {
             "v2/filemgr/delPaths", json: ["paths": cleaned, "forever": forever]
         )
         return FileDeleteResult(deleted: cleaned, forever: forever)
+    }
+
+    // MARK: 压缩 / 解压
+
+    /// 能解压的后缀，与 NAS 前端的静态表一致
+    static let archiveExts: Set<String> = ["zip", "rar", "7z", "tar", "gz", "tgz", "iso"]
+
+    /// 压缩（`POST v1/filemgr/compressedFile`）。
+    ///
+    /// NAS 侧的 `name` **不带后缀**，后缀由 `ext` 决定。返回 `{result: "<uuid>"}`，
+    /// 异步任务，实测 0.6 秒出包。
+    func compress(
+        paths: [String],
+        name: String,
+        ext: String = "zip",
+        out: String? = nil
+    ) async throws -> FileArchiveResult {
+        let cleaned = paths.filter { !$0.isEmpty }
+        guard !cleaned.isEmpty else { throw UgosError.auth("没有要压缩的条目") }
+        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { throw UgosError.auth("压缩包名不能为空") }
+        guard !trimmed.contains("/") else { throw UgosError.auth("压缩包名不能包含 /") }
+        let suffix = ext.lowercased().trimmingCharacters(in: CharacterSet(charactersIn: "."))
+        let outDir = out ?? FileService.parentPath(of: cleaned[0])
+        guard outDir.hasPrefix("/") else { throw UgosError.auth("输出目录必须是绝对路径") }
+
+        let payload = try await client.post(
+            "v1/filemgr/compressedFile",
+            json: [
+                "name": trimmed,
+                "ext": suffix,
+                "conflict_options": 0,
+                "out": outDir,
+                "paths": cleaned
+            ]
+        )
+        return FileArchiveResult(
+            taskID: FileService.text(FileService.field(payload, "result")) ?? "",
+            out: outDir,
+            expectName: "\(trimmed).\(suffix)",
+            isExtract: false
+        )
+    }
+
+    /// 压缩包要不要密码（`POST v1/filemgr/isEncryptZip {path}`）
+    func isEncryptedArchive(path: String) async throws -> Bool {
+        guard !path.isEmpty else { throw UgosError.auth("缺少压缩包路径") }
+        let payload = try await client.post("v1/filemgr/isEncryptZip", json: ["path": path])
+        if let flag = FileService.field(payload, "result") as? Bool { return flag }
+        if let flag = FileService.field(payload, "result") as? Int { return flag != 0 }
+        return false
+    }
+
+    /// 解压（`POST v1/filemgr/unCompressedFile`）。
+    ///
+    /// `out` 需要是**已存在**目录，这里会先建一个（已存在回 `1327`，忽略）。
+    /// `out` 留空时按 UGOS 网页端习惯解到「同名目录」（去掉后缀）。
+    func extract(
+        path: String,
+        to out: String? = nil,
+        password: String? = nil,
+        actionType: Int = 0
+    ) async throws -> FileArchiveResult {
+        guard path.hasPrefix("/") else { throw UgosError.auth("压缩包路径必须是绝对路径") }
+        let suffix = (path as NSString).pathExtension.lowercased()
+        guard FileService.archiveExts.contains(suffix) else {
+            throw UgosError.auth("不支持解压 .\(suffix)")
+        }
+        let target = out ?? String(path.dropLast(suffix.count + 1))
+
+        // 目标目录要先存在。已存在会回 1327，属于正常情况，忽略即可。
+        let parent = FileService.parentPath(of: target)
+        if parent != target {
+            _ = try? await createFolder(
+                parent: parent, name: (target as NSString).lastPathComponent
+            )
+        }
+
+        var body: [String: Any] = [
+            "out": target,
+            "path": path,
+            "action_type": actionType
+        ]
+        if let password, !password.isEmpty { body["password"] = password }
+        let payload = try await client.post("v1/filemgr/unCompressedFile", json: body)
+        return FileArchiveResult(
+            taskID: FileService.text(FileService.field(payload, "result")) ?? "",
+            out: target,
+            expectName: nil,
+            isExtract: true
+        )
+    }
+
+    /// 等压缩 / 解压落地：轮询输出目录。
+    ///
+    /// 压缩看预期包名出现，解压看目录变非空。同样没有进度接口，只能这样判。
+    func waitForArchive(
+        _ result: FileArchiveResult,
+        attempts: Int = 30,
+        interval: TimeInterval = 1.0
+    ) async throws {
+        for _ in 0..<max(1, attempts) {
+            if let listing = try? await list(path: result.out, page: 1, sort: .name, reverse: false) {
+                if let expected = result.expectName {
+                    if listing.entries.contains(where: { $0.name == expected }) { return }
+                } else if !listing.entries.isEmpty {
+                    return
+                }
+            }
+            try? await Task.sleep(nanoseconds: UInt64(interval * 1_000_000_000))
+        }
+        throw UgosError.auth(result.isExtract ? "解压还没完成，等下刷新看看" : "压缩还没完成，等下刷新看看")
+    }
+
+    /// 取绝对路径的父目录
+    static func parentPath(of path: String) -> String {
+        let parent = (path as NSString).deletingLastPathComponent
+        return parent.isEmpty ? path : parent
     }
 
     // MARK: 复制 / 移动

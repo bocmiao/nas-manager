@@ -80,6 +80,9 @@ ACTION_TYPE_COVER = 1
 ACTION_TYPE_SAVE = 3
 ACTION_TYPE_ASK = 4
 
+# 能解压的后缀（前端静态表 O0）
+ARCHIVE_EXTS = ("zip", "rar", "7z", "tar", "gz", "tgz", "iso")
+
 # 单次 POST 承载的字节数。NAS 侧不限制块大小（前端从 128KB 自增到 100MB），
 # 这里取 8MB：既不会让网关超时，也不会把内存吃满。
 UPLOAD_CHUNK_SIZE = 8 * 1024 * 1024
@@ -423,6 +426,98 @@ class FileService:
         if not data:
             raise FileRejected("预览返回空内容")
         return data, ctype
+
+    # MARK: 压缩 / 解压
+
+    async def compress(
+        self,
+        paths: list[str],
+        name: str,
+        ext: str = "zip",
+        out: str | None = None,
+        conflict_options: int = 0,
+    ) -> dict:
+        """压缩（`POST v1/filemgr/compressedFile`），返回 `{task_id, out, ext, name}`。
+
+        实测：`{name, ext, conflict_options, out, paths}` 一次就完，
+        返回 `{result: "<uuid>"}` 是**异步任务**，但几百字节的文件 0.6 秒就出包了。
+        `name` **不含后缀**，后缀由 `ext` 决定。
+        """
+        if not paths:
+            raise FileRejected("paths 不能为空")
+        if not isinstance(paths, list):
+            raise FileRejected("paths 必须是路径数组")
+        clean_paths = [sanitize_path(p) for p in paths]
+        clean_out = sanitize_path(out or posixpath.dirname(clean_paths[0]))
+        clean_ext = (ext or "zip").lower().lstrip(".")
+        clean_name = (name or "").strip()
+        if not clean_name:
+            raise FileRejected("压缩包名不能为空")
+        if "/" in clean_name:
+            raise FileRejected("压缩包名不能包含 /")
+
+        raw = await self._c.post("v1/filemgr/compressedFile", {
+            "name": clean_name,
+            "ext": clean_ext,
+            "conflict_options": int(conflict_options),
+            "out": clean_out,
+            "paths": clean_paths,
+        }) or {}
+        return {
+            "task_id": str(raw.get("result") or ""),
+            "name": f"{clean_name}.{clean_ext}",
+            "ext": clean_ext,
+            "out": clean_out,
+            "paths": clean_paths,
+        }
+
+    async def is_encrypted_archive(self, path: str) -> bool:
+        """压缩包要不要密码（`POST v1/filemgr/isEncryptZip {path}`）。
+
+        实测返回 `{result: false}`。`result` 为真时 `extract` 必须带 `password`，
+        否则 NAS 侧会失败。
+        """
+        raw = await self._c.post(
+            "v1/filemgr/isEncryptZip", {"path": sanitize_path(path)}
+        ) or {}
+        return bool(raw.get("result"))
+
+    async def extract(
+        self,
+        path: str,
+        out: str | None = None,
+        password: str | None = None,
+        action_type: int = ACTION_TYPE_SKIP,
+    ) -> dict:
+        """解压（`POST v1/filemgr/unCompressedFile`），返回 `{task_id, out, path}`。
+
+        实测：`{out, path, action_type}` 直接开工，返回 `{result: "<uuid>"}` 也是异步任务，
+        0.6 秒解完。`out` **需要是已存在的目录**——调用方要先建（已存在会回 `1327`，忽略即可）。
+        `out` 留空时按 UGOS 网页端的习惯解到「同名目录」（去掉后缀）。
+        """
+        clean_path = sanitize_path(path)
+        ext = posixpath.splitext(clean_path)[1].lstrip(".").lower()
+        if ext not in ARCHIVE_EXTS:
+            raise FileRejected(
+                f"不支持解压 .{ext}，只认 {'/'.join(ARCHIVE_EXTS)}"
+            )
+        clean_out = (
+            sanitize_path(out) if out
+            else sanitize_path(posixpath.splitext(clean_path)[0])
+        )
+        payload = {
+            "out": clean_out,
+            "path": clean_path,
+            "action_type": int(action_type),
+        }
+        if password:
+            payload["password"] = password
+        raw = await self._c.post("v1/filemgr/unCompressedFile", payload) or {}
+        return {
+            "task_id": str(raw.get("result") or ""),
+            "out": clean_out,
+            "path": clean_path,
+        }
 
     async def copy_or_move(
         self,

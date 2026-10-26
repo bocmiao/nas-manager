@@ -654,6 +654,49 @@ final class AppModel {
         }
     }
 
+    /// 压缩。返回后任务还在后台跑，要等落地调 `fileWaitArchive`。
+    @MainActor
+    func fileCompress(paths: [String], name: String) async throws -> FileArchiveResult {
+        guard let fileService = fileService else { throw UgosError.auth("尚未连接") }
+        do {
+            return try await fileService.compress(paths: paths, name: name)
+        } catch {
+            throw UgosError.auth(FileService.friendly(error))
+        }
+    }
+
+    /// 压缩包要不要密码
+    @MainActor
+    func fileArchiveEncrypted(path: String) async throws -> Bool {
+        guard let fileService = fileService else { throw UgosError.auth("尚未连接") }
+        do {
+            return try await fileService.isEncryptedArchive(path: path)
+        } catch {
+            throw UgosError.auth(FileService.friendly(error))
+        }
+    }
+
+    /// 解压到同名目录
+    @MainActor
+    func fileExtract(path: String, password: String?) async throws -> FileArchiveResult {
+        guard let fileService = fileService else { throw UgosError.auth("尚未连接") }
+        do {
+            return try await fileService.extract(path: path, password: password)
+        } catch {
+            throw UgosError.auth(FileService.friendly(error))
+        }
+    }
+
+    @MainActor
+    func fileWaitArchive(_ result: FileArchiveResult) async throws {
+        guard let fileService = fileService else { throw UgosError.auth("尚未连接") }
+        do {
+            try await fileService.waitForArchive(result)
+        } catch {
+            throw UgosError.auth(FileService.friendly(error))
+        }
+    }
+
     @MainActor
     func downloadFile(path: String) async throws -> Data {
         guard let fileService = fileService else { throw UgosError.auth("尚未连接") }

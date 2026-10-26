@@ -1200,6 +1200,51 @@ async def files_transfer(
     return ok(result)
 
 
+@router.post("/files/compress", dependencies=[Depends(require_auth)])
+async def files_compress(
+    paths: list[str] = Body(..., embed=True, description="要打包的绝对路径数组"),
+    name: str = Body(..., embed=True, description="包名，**不含**后缀"),
+    ext: str = Body("zip", embed=True, description="压缩格式后缀"),
+    out: str | None = Body(None, embed=True, description="输出目录，默认取第一个路径的父目录"),
+    conflict_options: int = Body(0, embed=True),
+    files: FileService = Depends(get_files),
+):
+    """压缩成压缩包。返回 `{task_id, name, ext, out, paths}`。
+
+    实测是异步任务（返回 uuid），但几百字节的文件 0.6 秒就出包。
+    没有进度查询接口，客户端轮询输出目录判断落地。
+    """
+    try:
+        return ok(await files.compress(
+            paths, name, ext=ext, out=out, conflict_options=conflict_options
+        ))
+    except FileRejected as exc:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, detail=exc.msg) from exc
+
+
+@router.post("/files/extract", dependencies=[Depends(require_auth)])
+async def files_extract(
+    path: str = Body(..., embed=True, description="压缩包绝对路径"),
+    out: str | None = Body(None, embed=True, description="解压目标目录，默认同名目录"),
+    password: str | None = Body(None, embed=True, description="加密压缩包的密码"),
+    action_type: int = Body(
+        0, embed=True, description="0=跳过同名 1=覆盖 3=另存改名"
+    ),
+    files: FileService = Depends(get_files),
+):
+    """解压。返回 `{task_id, out, path}`。
+
+    只认 `zip/rar/7z/tar/gz/tgz/iso`。`out` 需要是已存在目录，
+    不存在先新建（已存在会回 `1327`，忽略即可）。
+    """
+    try:
+        return ok(await files.extract(
+            path, out=out, password=password, action_type=action_type
+        ))
+    except FileRejected as exc:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, detail=exc.msg) from exc
+
+
 @router.post("/files/upload", dependencies=[Depends(require_auth)])
 async def files_upload(
     request: Request,

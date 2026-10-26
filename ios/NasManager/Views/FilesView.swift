@@ -68,6 +68,8 @@ struct FilesView: View {
     @State private var previewEntry: FileEntry?
     @State private var pendingTransfer: TransferRequest?
     @State private var transferNote: String?
+    @State private var passwordEntry: FileEntry?
+    @State private var archivePassword = ""
 
     @State private var showingImporter = false
     @State private var uploadProgress: FileUploadProgress?
@@ -206,6 +208,13 @@ struct FilesView: View {
             Button("好", role: .cancel) { transferNote = nil }
         } message: {
             Text(transferNote ?? "")
+        }
+        .alert("这个压缩包需要密码", isPresented: passwordPromptBinding) {
+            TextField("密码", text: $archivePassword)
+            Button("取消", role: .cancel) { passwordEntry = nil }
+            Button("解压") { submitArchivePassword() }
+        } message: {
+            Text(passwordEntry?.name ?? "")
         }
     }
 
@@ -539,6 +548,20 @@ struct FilesView: View {
                     Label("移动到…", systemImage: "arrow.turn.down.right")
                 }
             }
+            if entry.canExtract {
+                Button {
+                    Task { await startExtract(entry) }
+                } label: {
+                    Label("解压到同名目录", systemImage: "archivebox")
+                }
+            }
+            if entry.isDeletable {
+                Button {
+                    Task { await performCompress(paths: [entry.path], baseName: entry.archiveBaseName) }
+                } label: {
+                    Label("压缩成 ZIP", systemImage: "doc.zipper")
+                }
+            }
             if entry.isRenamable {
                 Button {
                     renameText = entry.name
@@ -665,6 +688,15 @@ struct FilesView: View {
             get: { transferNote != nil },
             set: { visible in
                 if !visible { transferNote = nil }
+            }
+        )
+    }
+
+    private var passwordPromptBinding: Binding<Bool> {
+        Binding(
+            get: { passwordEntry != nil },
+            set: { visible in
+                if !visible { passwordEntry = nil }
             }
         )
     }
@@ -902,6 +934,76 @@ struct FilesView: View {
             transferNote = request.move
                 ? "已移动到 \(destination)"
                 : "已复制到 \(destination)"
+        } catch {
+            actionError = error.localizedDescription
+        }
+    }
+
+    /// 当前目录里挑一个不撞名的压缩包名。NAS 侧的 `conflict_options` 语义没验证过，
+    /// 与其赌它会不会静默覆盖，不如本地先把名字错开。
+    private func uniqueArchiveBase(_ base: String) -> String {
+        let taken = Set(entries.map(\.name))
+        var candidate = base
+        var index = 0
+        while taken.contains("\(candidate).zip") {
+            index += 1
+            candidate = "\(base)(\(index))"
+        }
+        return candidate
+    }
+
+    /// 压缩。跟复制一样是异步任务且查不到进度，靠轮询输出目录判落地。
+    @MainActor
+    private func performCompress(paths: [String], baseName: String) async {
+        guard let dir = stack.last?.path, !dir.isEmpty else {
+            actionError = "根分类不是可写路径，请先进入具体文件夹"
+            return
+        }
+        busyPath = paths.first ?? ""
+        defer { busyPath = nil }
+        do {
+            let result = try await model.fileCompress(
+                paths: paths, name: uniqueArchiveBase(baseName)
+            )
+            try await model.fileWaitArchive(result)
+            await reload()
+            transferNote = "已生成 \(result.expectName ?? "压缩包")"
+        } catch {
+            actionError = error.localizedDescription
+        }
+    }
+
+    /// 解压入口：先问 NAS 要不要密码，再决定是弹输入框还是直接解。
+    @MainActor
+    private func startExtract(_ entry: FileEntry) async {
+        do {
+            if try await model.fileArchiveEncrypted(path: entry.path) {
+                archivePassword = ""
+                passwordEntry = entry
+            } else {
+                await runExtract(entry, password: nil)
+            }
+        } catch {
+            actionError = error.localizedDescription
+        }
+    }
+
+    private func submitArchivePassword() {
+        guard let entry = passwordEntry else { return }
+        let password = archivePassword
+        passwordEntry = nil
+        Task { await runExtract(entry, password: password.isEmpty ? nil : password) }
+    }
+
+    @MainActor
+    private func runExtract(_ entry: FileEntry, password: String?) async {
+        busyPath = entry.path
+        defer { busyPath = nil }
+        do {
+            let result = try await model.fileExtract(path: entry.path, password: password)
+            try await model.fileWaitArchive(result)
+            await reload()
+            transferNote = "已解压到 \(result.out)"
         } catch {
             actionError = error.localizedDescription
         }

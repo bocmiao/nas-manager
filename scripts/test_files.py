@@ -611,6 +611,87 @@ def test_transfer() -> None:
     check("非法入参全部本地拒绝", not leaked, str(leaked))
 
 
+# ---------------------------------------------------------------- 11. 压缩/解压
+
+def test_archive() -> None:
+    print("\n[11] 压缩 / 解压")
+
+    async def compress():
+        s, c = svc({"v1/filemgr/compressedFile": {"result": "task-1"}})
+        return await s.compress(
+            ["/volume1/docker/a.txt", "/volume1/docker/b.txt"], "打包"
+        ), c
+
+    r, c = asyncio.run(compress())
+    check("返回 task_id", r.get("task_id") == "task-1", str(r))
+    check("包名带后缀", r.get("name") == "打包.zip", str(r.get("name")))
+    body = last_body(c)
+    check("name 不含后缀（后缀由 ext 决定）", body.get("name") == "打包", str(body.get("name")))
+    check("ext 默认 zip", body.get("ext") == "zip", str(body.get("ext")))
+    check("paths 是字符串数组", body.get("paths") == ["/volume1/docker/a.txt", "/volume1/docker/b.txt"], str(body.get("paths")))
+    check("out 缺省取第一个路径的父目录", body.get("out") == "/volume1/docker", str(body.get("out")))
+
+    async def encrypt():
+        s, _ = svc({"v1/filemgr/isEncryptZip": {"result": True}})
+        return await s.is_encrypted_archive("/volume1/docker/a.zip")
+
+    check("isEncryptZip 读 result", asyncio.run(encrypt()) is True)
+
+    async def encrypt_false():
+        s, _ = svc({"v1/filemgr/isEncryptZip": {"result": False}})
+        return await s.is_encrypted_archive("/volume1/docker/a.zip")
+
+    check("不加密时返回 False", asyncio.run(encrypt_false()) is False)
+
+    async def extract():
+        s, c = svc({"v1/filemgr/unCompressedFile": {"result": "task-2"}})
+        return await s.extract("/volume1/docker/打包.zip"), c
+
+    r, c = asyncio.run(extract())
+    check("解压返回 task_id", r.get("task_id") == "task-2", str(r))
+    body = last_body(c)
+    check("out 默认去后缀的同名目录", body.get("out") == "/volume1/docker/打包", str(body.get("out")))
+    check("不带 password 字段", "password" not in body, str(body.keys()))
+
+    async def extract_pwd():
+        s, c = svc({"v1/filemgr/unCompressedFile": {"result": "task-3"}})
+        await s.extract("/volume1/docker/x.zip", password="123456")
+        return c
+
+    c = asyncio.run(extract_pwd())
+    check("有密码时带上 password", last_body(c).get("password") == "123456", str(last_body(c)))
+
+    async def guard():
+        s, _ = svc({})
+        cases = [
+            (("/volume1/docker/a.txt",), {}, "不支持的格式"),
+            (("/volume1/../etc/x.zip",), {}, "解压路径含 .."),
+        ]
+        leaked = []
+        for args, kw, why in cases:
+            try:
+                await s.extract(*args, **kw)
+                leaked.append(why)
+            except FileRejected:
+                pass
+        for paths, name, out, why in [
+            ([], "x", None, "空 paths"),
+            ("/volume1/docker/a.txt", "x", None, "paths 非数组"),
+            (["/volume1/docker/a.txt"], "", None, "空包名"),
+            (["/volume1/docker/a.txt"], "a/b", None, "包名含 /"),
+            (["/volume1/../etc/a"], "x", None, "路径含 .."),
+        ]:
+            try:
+                await s.compress(paths, name, out=out)
+                leaked.append(why)
+            except FileRejected:
+                pass
+        return leaked
+
+    leaked = asyncio.run(guard())
+    check("非法入参全部本地拒绝", not leaked, str(leaked))
+
+
 def main() -> int:
     test_sanitize()
     test_list_body()
@@ -622,6 +703,7 @@ def main() -> int:
     test_upload()
     test_roots()
     test_transfer()
+    test_archive()
 
     failed = [r for r in results if r[0] == FAIL]
     print("\n" + "=" * 50)

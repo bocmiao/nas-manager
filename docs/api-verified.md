@@ -1149,3 +1149,49 @@ v1/vm/info   v1/vm/snapshot/list      v1/kvm/vm/list
 | `ios/NasManager/Views/DestinationPickerView.swift` | 目标目录选择器，只列目录，被操作条目自身不可选 |
 | `ios/NasManager/Views/FilesView.swift` | 左滑「复制 / 移动」+ 右键菜单「复制到… / 移动到…」 |
 | `scripts/probe_copy_move.py` / `probe_copy_move2.py` | 真机契约探针（沙盒目录，测完删除） |
+
+## 四之十、压缩 / 解压（89~91，2026-10-26 实测）
+
+89. **压缩 `POST v1/filemgr/compressedFile`**：
+
+    ```json
+    {"name": "probe", "ext": "zip", "conflict_options": 0,
+     "out": "/volume1/docker/src", "paths": ["/volume1/docker/src/note.txt"]}
+    ```
+
+    - `name` **不含后缀**，后缀由 `ext` 决定
+    - `out` 是输出目录
+    - 返回 `{result: "<uuid>"}` = 异步任务
+    - 实测 0.6 秒出包，生成 `probe.zip`
+    - `conflict_options` 的取值语义**没有验证**（本轮测的是不撞名的场景），
+      所以客户端应自己先把包名错开，别赌它不会覆盖
+
+90. **是否需要密码 `POST v1/filemgr/isEncryptZip {path}`** → `{result: false}`。
+    `result` 为真时解压必须带 `password`。
+
+91. **解压 `POST v1/filemgr/unCompressedFile`**：
+
+    ```json
+    {"out": "/volume1/docker/out", "path": "/volume1/docker/src/probe.zip",
+     "action_type": 0, "password": "<加密时才带>"}
+    ```
+
+    - 返回 `{result: "<uuid>"}` = 异步任务，实测 0.6 秒解完，内容正确
+    - `out` **需要是已存在的目录**，调用方要先建（已存在回 `1327`，忽略即可）
+    - `out` 留空时 UGOS 网页端的习惯是解到「同名目录」（去掉后缀）
+    - 支持的后缀（前端静态表 `O0`）：`zip / rar / 7z / tar / gz / tgz / iso`
+
+92. **`getArchiveFileInfo` 调不通**：`v2/filemgr/getArchiveFileInfo` 无论传
+    `{path}` 还是 `{paths:[path]}` 都回 `9404`。前端配置里它带
+    `whitListCode: [1360]`，说明正常路径下也可能回 `1360`。
+    拿压缩包内文件清单这条路暂时走不通，不影响压缩 / 解压本身。
+
+### 落地
+
+| 位置 | 做了什么 |
+|---|---|
+| `server/app/services/files.py` | `compress()` / `is_encrypted_archive()` / `extract()`，新增 `ARCHIVE_EXTS` |
+| `server/app/api/routes.py` | `POST /files/compress`、`POST /files/extract` |
+| `ios/NasManager/Core/FileService.swift` | `compress` / `isEncryptedArchive` / `extract` + `waitForArchive()` 轮询落地 |
+| `ios/NasManager/Views/FilesView.swift` | 菜单「压缩成 ZIP」/「解压到同名目录」，加密包弹密码输入框 |
+| `scripts/probe_archive.py` | 真机闭环探针（建沙盒 → 压 → 解 → 校验 → 全删） |
