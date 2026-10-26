@@ -887,6 +887,17 @@ class NasService:
 
     # ------------------------------------------------------------------ 硬盘休眠
 
+    async def power_config(self) -> dict:
+        """`v1/hardware/power/config` 原始配置。
+
+        同一个接口同时承载「硬盘休眠」与「电源计划」（`time_switches` / `power_boot` /
+        `wake_on` / `enable_scheduled_power`），因此单独缓存一份给两个视图共用，
+        避免一次巡检里重复请求。**只读**。
+        """
+        return await self._cache.get_or_set(
+            "power_config", 60.0, lambda: self._c.get("v1/hardware/power/config") or {}
+        )
+
     async def disk_sleep_policy(self) -> dict:
         """硬盘休眠策略（`v1/hardware/power/config`，实测可用）。
 
@@ -896,7 +907,7 @@ class NasService:
         return await self._cache.get_or_set("sleep_policy", 60.0, self._fetch_sleep_policy)
 
     async def _fetch_sleep_policy(self) -> dict:
-        raw = await self._c.get("v1/hardware/power/config") or {}
+        raw = await self.power_config()
         targets = raw.get("hard_drive_target_info") or {}
         usb_targets = raw.get("usb_hard_drive_target_info") or {}
 
@@ -1001,36 +1012,6 @@ class NasService:
             )
         return out
 
-    # ------------------------------------------------------------------ 日志
-
-    async def logs(self, page: int = 1, size: int = 50, level: str = "",
-                   module: str = "", keyword: str = "") -> dict:
-        params: dict[str, Any] = {"page": page, "size": size}
-        if level:
-            params["level"] = level
-        if module:
-            params["module"] = module
-        if keyword:
-            params["keyword"] = keyword
-        raw = await self._c.get("v1/log/query", params) or {}
-        items = raw.get("log_list") or []
-        return {
-            "page": raw.get("cur_page", page),
-            "total": raw.get("total", len(items)),
-            "items": [
-                {
-                    "id": it.get("log_id"),
-                    "level": it.get("level"),
-                    "module": it.get("module"),
-                    "operator": it.get("operator"),
-                    "content": it.get("content"),
-                    "time": it.get("create_time"),
-                }
-                for it in items
-                if isinstance(it, dict)
-            ],
-        }
-
     # ------------------------------------------------------------------ 能力探测
 
     async def capabilities(self) -> dict:
@@ -1104,4 +1085,33 @@ class NasService:
             caps["ups_connected"] = bool((await self.system()).get("ups"))
         except Exception:  # noqa: BLE001
             caps["ups_connected"] = False
+
+        # 第四批：会话 / 风扇 / 备份 / 电源计划 / 虚拟机
+        try:
+            await self._c.post("v1/user/online/list",
+                               {"uid_list": [], "user_type": "user", "page": 1, "size": 1})
+            caps["sessions"] = True
+        except Exception:  # noqa: BLE001
+            caps["sessions"] = False
+        for name, path in (
+            ("fan", "v1/hardware/fan/config"),
+            ("backup", "v1/web/sync/task/list"),
+            ("power_plan", "v1/hardware/power/config"),
+        ):
+            try:
+                await self._c.get(path)
+                caps[name] = True
+            except Exception as exc:  # noqa: BLE001
+                log.warning("能力探测失败 %s: %s", name, exc)
+                caps[name] = False
+        # 虚拟机是独立应用，未安装时后端整个模块都是 404，只能看应用清单
+        try:
+            raw = await self._c.get("v1/desktop/module/list") or {}
+            ids = [str(m.get("module_id") or "").lower() for m in (raw.get("result") or [])
+                   if isinstance(m, dict)]
+            caps["virtual_machine"] = any(
+                "virtualmachine" in i or i.endswith(".vm") or ".kvm" in i for i in ids
+            )
+        except Exception:  # noqa: BLE001
+            caps["virtual_machine"] = False
         return caps

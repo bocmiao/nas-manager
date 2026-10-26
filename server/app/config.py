@@ -76,12 +76,24 @@ class Settings(BaseSettings):
     alert_volume_inode: float = 90.0
     alert_volume_inode_critical: float = 95.0
 
+    # --- 第四批告警阈值 ---
+    # 同一来源 IP 在窗口内登录失败次数达到阈值即告警（NAS 自带 faillock 默认 6 次/5 分钟锁定）
+    alert_login_fail_count: int = 10
+    alert_login_fail_window: int = 300
+    # 备份任务超过该小时数没有成功运行即告警（0 表示关闭该条）
+    alert_backup_stale_hours: float = 48.0
+
     # --- 用户 / 共享 ---
     ttl_users: float = 60.0
     # 最后登录时间要靠审计日志反查，单独给一个较长的缓存
     ttl_user_login: float = 300.0
     ttl_network: float = 15.0
     ttl_processes: float = 30.0
+    # 在线会话变化快，缓存要短；备份任务状态同理但可松一点
+    ttl_sessions: float = 5.0
+    ttl_backup: float = 30.0
+    ttl_fans: float = 5.0
+    ttl_vm: float = 300.0
 
     # --- 磁盘测速 ---
     benchmark_poll_seconds: float = 3.0

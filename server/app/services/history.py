@@ -22,7 +22,9 @@ METRICS: dict[str, dict] = {
     "cpu": {"unit": "%", "label": "CPU 使用率"},
     "mem": {"unit": "%", "label": "内存使用率"},
     "cpu_temp": {"unit": "°C", "label": "CPU 温度"},
+    # stat/overview 分别报 cpu_fan 与 device_fan 两路转速：fan 沿用机箱风扇，fan_cpu 为 CPU 风扇
     "fan": {"unit": "RPM", "label": "机箱风扇转速"},
+    "fan_cpu": {"unit": "RPM", "label": "CPU 风扇转速"},
     "net_tx": {"unit": "B/s", "label": "网口发送速率"},
     "net_rx": {"unit": "B/s", "label": "网口接收速率"},
     "disk_temp": {"unit": "°C", "label": "磁盘温度", "per_disk": True},
@@ -59,10 +61,12 @@ class HistoryRecorder:
             live = {}
 
         if live:
+            fans = live.get("fans") or {}
             self._push("cpu", ts, (live.get("cpu") or {}).get("used_percent"))
             self._push("mem", ts, (live.get("memory") or {}).get("used_percent"))
             self._push("cpu_temp", ts, (live.get("cpu") or {}).get("temp"))
-            self._push("fan", ts, ((live.get("fans") or {}).get("device") or {}).get("speed"))
+            self._push("fan", ts, (fans.get("device") or {}).get("speed"))
+            self._push("fan_cpu", ts, (fans.get("cpu") or {}).get("speed"))
             self._push("net_tx", ts, (live.get("net") or {}).get("send_bps"))
             self._push("net_rx", ts, (live.get("net") or {}).get("recv_bps"))
 

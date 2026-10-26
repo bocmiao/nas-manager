@@ -532,3 +532,199 @@ GET https://<ip>:9443<entry>/js/*.js     → 正则提取 "v\d+/模块/动作"
 - **RAID0 + 2 盘 = 零冗余**，任一盘损坏全部数据丢失。
 - 网口只协商到 **1000Mbps**，机型是双 2.5GbE，怀疑上游是千兆交换机或网线为 Cat5e。
 - `/opt/<third-party-panel>/data` 显示已装第三方面板，与 UGOS 自带 Docker 共用需注意目录冲突。
+
+---
+
+## 六、第四批实测（在线会话 / 风扇 / 备份 / 电源计划 / 日志 / 虚拟机）
+
+> 验证时间：2026-10-26。所有 IP / 主机名 / 账号在本文档中均为占位值（`192.0.2.10` / `<用户名>`），
+> 接口本身返回真实值——那是给用户自己看的。
+
+### 1. 在线会话（`POST v1/user/online/list`）
+
+| 项 | 值 |
+|---|---|
+| 方法 | **只吃 POST**，GET 返回 `9404` |
+| body | `{"uid_list": [], "user_type": "user", "page": 1, "size": 50}` |
+| 分页 | **`page` 从 1 开始**（与 `log/query` 相反） |
+| 返回 | `{total, page, size, list:[...]}` |
+
+`list[]` 字段（实测）：
+
+| 字段 | 含义 | 实测值示例 |
+|---|---|---|
+| `id` | 会话 ID（踢人时用） | `203` |
+| `username` / `uid` | 账号 | `<用户名>` / `1003` |
+| `ip` | **客户端来源 IP** | `192.0.2.10` |
+| `host` | 接入时用的 NAS 侧地址 | `192.0.2.10`（同批 Web 会话全同值） |
+| `login_time` | 登录时间，Unix 秒 | `1792976494` |
+| `connection_duration` | 已连接秒数 | `249` |
+| `platform` | 客户端类型 | `2`=iOS `4`=Android `5`=- `6`=TV `7`=HarmonyOS `8`=HyperOS `9`=PC/WEB `10`=车机 `11`=HDMI |
+| `protocol` | 协议 | `0`=HTTP `1`=HTTPS `2`=SMB `3`=FTP(S) `4`=SFTP `5`=SSH `6`=- |
+| `connect` / `login_status` | 是否仍连着 / 登录态 | `true` |
+| `is_current_connection` | 是不是"当前这条" | `true` 仅一条 |
+| `pid` | SSH 会话的进程号 | `"3326367"` 或 `""` |
+
+- 踢人：`POST v1/user/online/stop` 传 `{"id": <会话 id>}`，**前端只对 protocol 0/1（HTTP/HTTPS）开放**。
+  中间层**未实现**（强制下线属高危操作）。
+- 实测观察：反复登录会累积会话记录（脚本反复登录后本机列表涨到 23 条，`connect` 恒 `true`），
+  NAS 不会立即清理未正常登出的会话。中间层照实返回，不过滤也不臆断。
+
+### 2. 登录审计（没有独立接口）
+
+猜过的路径全部不存在：`v1/user/login/record`、`v1/user/login/list`、`v1/user/session/list`、
+`v1/user/online/history` 都是 `9404`；`v1/session/list`、`v1/log/login`、`v1/security/login/*` 是 **HTTP 404**。
+
+唯一数据源是审计日志 `GET v1/log/query?module=login`：
+
+| 场景 | level | content 形态 |
+|---|---|---|
+| Web/App 登录成功 | `info` | `User [<用户名>] from [192.0.2.10] logged in successfully.` |
+| Web/App 密码错误 | `warning` | `User [<用户名>] from [192.0.2.10] failed to log in due to incorrect username or password.` |
+| SSH 登录成功 | `info` | `User <用户名> logged into the system via SSH.`（**没有 IP**，operator 是 `system`） |
+
+> 失败形态是用**一次**受控的错误密码登录实测出来的（先确认 NAS 自带 faillock 是「5 分钟 6 次」，
+> 1 次远低于阈值，不会锁账号）。本机 2500+ 条日志里只有这一条失败记录。
+
+`faillock`（只读，中间层不改）：
+
+| 接口 | 返回 |
+|---|---|
+| `GET v1/security/faillock/config` | `{"status":1,"unlock_unit":"minute","faillock":{"deny":6,"fail_interval":5,"unlock_time":5}}` |
+| `GET v1/security/faillock/blocklist` | `{"result":[]}` |
+| `GET v1/security/faillock/whitelist` | `{"result":[]}` |
+
+### 3. 风扇（只读）
+
+| 接口 | 用途 |
+|---|---|
+| `GET v1/hardware/fan/config` | 当前策略与档位表 |
+| `GET v1/taskmgr/stat/overview` | 实际转速 `cpu_fan{speed,status}` / `device_fan{speed,status}` |
+| `GET v1/hardware/fan/start?mode=<n>` | **改模式（写）**，未实现 |
+| `POST v1/hardware/fan/setfan` | **下发自定义曲线（写）**，未实现 |
+
+`fan/config` 实测返回：
+
+```json
+{"mode": 2, "result": 2, "support_custom": false,
+ "has_sys_fan": false, "has_cpu_fan": false,
+ "sys_fan_table": [], "cpu_fan_table": []}
+```
+
+- `mode` 枚举只有前端知道（`fanModal` 的预设列表）：**1=静音 2=自动 3=全速 4=自定义**。
+  `result` 与 `mode` 实测同值，保留原字段。
+- 转速实测：机箱 545 RPM、CPU 风扇 385~1483 RPM（空闲时 CPU 风扇会停到 0，`status` 仍为 1）。
+- **目标转速拿不到**：所有端点都只有实际转速，没有 PWM / 目标值字段。
+- **档位表拿不到**：`support_custom=false` 且两张表为空数组；前端逻辑里只有机型不在
+  `["dxp4800"]` 白名单时才显示自定义曲线，DXP4800 系列只给三个预设。
+- `has_sys_fan` / `has_cpu_fan` 均为 `false` 却同时有两路转速 —— 这两个标志**不能**用来判断风扇有无。
+
+### 4. 同步与备份
+
+| 接口 | 说明 |
+|---|---|
+| `GET v1/web/sync/task/list` | 任务列表，`{all_count, count, list:[]}` |
+| `GET v1/web/sync/task/detail?…` | 单任务详情（本机无任务，未验证） |
+| `GET v1/web/sync/log/task/list` | 执行历史，同样结构 |
+| `GET v1/web/sync/log/task/summary` | `{"transferringCount":0}` |
+| `GET v1/web/sync/warn/list` | 备份告警横幅 `{"log_level":1,"list":null}` |
+| `GET v1/web/sync/connection/list` | 已配对客户端 `{result:[…]}` |
+| `GET v1/web/sync/general/get` | 全局设置（保留份数、限速等） |
+
+**查询参数即表字段**（踩坑 49）：传未知字段名会报 `9999 操作失败! no such column: xxx`。
+用这个差异探得可用列：`id`(int) `task_name` `status` `protocol` `user` `uid`(int) `progress`(int)
+`size`(int) `backup_type` `sync_mode` `backup_local_paths` `backup_remote_paths` `schedule_time`。
+
+状态枚举（前端 `TaskStatus`，两套编号一致）：
+
+| code | 含义 | 字符串形态 |
+|---|---|---|
+| 0 | 已完成 | `finished` / `partialSuccess` |
+| 1 | 失败 | `error` |
+| 2 | 扫描中 | `scanning` |
+| 3 | 已暂停 | `paused` |
+| 4 | 进行中 | `progress` |
+| 5 | 未开始 | `unStart` |
+| 6 | 等待中 | `waiting` |
+
+其它枚举：`backup_type` 1=增量 2=镜像 3=多版本；`schedule_type` 1=自动 2=手动 3=计划。
+
+> **本机 0 个任务**（`list` 为空），只有 1 个已配对客户端（手机相册备份，`sync_protocol=pic`）。
+> 因此任务条目的字段名只能按上表 + 前端归一化逻辑推断，接口里标 `schema_verified=false`，
+> 每条都带 `raw`。**没有为了测试去创建备份任务**。
+> 写操作（`task/sync`、`task/delete`、`task/now`、`task/pause`）一律不实现。
+
+### 5. 电源计划（只读）
+
+**没有独立接口**：`v1/hardware/power/{plan,schedule,list,time_switch}` 全 `9404`，
+`v1/power/{plan,list}` 是 HTTP 404；`v1/hardware/wol/config` 也是 `9404`。
+计划表就在 `GET v1/hardware/power/config` 里（与硬盘休眠策略同一个接口）：
+
+```json
+{"enable_scheduled_power": true,
+ "power_boot": true,
+ "wake_on": true,
+ "time_switches": [{"frequency": [7,1,2,3,4,5,6], "time": "08:00", "action": "open"}]}
+```
+
+- `frequency` 星期编号（前端 `convertDay` 语义）：**1=周一 … 5=周五，6=周六，7=周日**；
+  `[1..5]` 显示「工作日」，`[6,7]` 显示「周末」，`[1..7]` 显示「每天」。
+- `action` 实测 `open` / `close`，前端把它们显示成「开机 / 关机」。
+- `power_boot` / `wake_on` 只能按前端字段名直译（通电启动 / 唤醒），
+  本机语言包里取不到对应中文文案，**未改写语义**。
+- 写接口 `v1/hardware/power/start` 会改计划，误改会让 NAS 不按预期启停，未实现。
+
+### 6. 日志查询（`GET v1/log/query`）参数全集
+
+| 参数 | 说明 |
+|---|---|
+| `page` | **0 起**（前端 `page: this.page - 1`），回显在 `cur_page`，也是 0 起 |
+| `size` | 实测 500 仍可用 |
+| `level` | 可重复：`?level=warning&level=critical`；只认 `info`/`warning`/`critical` |
+| `module` | 可重复；取值见 `v1/log/usersandmodules` 的 `modules` |
+| `operator` | 可重复；前端筛选器用它按账号过滤 |
+| `keyword` | 正文关键词（英文有效，中文命中 0 条——日志正文本身是英文） |
+| `from_time` / `to_time` | Unix 秒；给未来区间返回 0 条，确认是真过滤 |
+| `order` / `order_param` | `up`/`down` × `create_time`/`level`/`module`/`operator` |
+| 返回 | `{cur_page, total, log_list:[{log_id, level, module, operator, content, create_time}]}` |
+
+`GET v1/log/usersandmodules` → `{"levels":["info","warning","critical"], "modules":[…11 个…], "users":[…]}`。
+
+### 7. KVM 虚拟机（未安装）
+
+`GET v1/desktop/module/list` 本机 **31 个应用，无虚拟机**（无 `com.ugreen.virtualmachine`、
+名称也无「虚拟机」）。因此以下路径全部 **HTTP 404 非 JSON**（模块未挂载）：
+
+```
+v1/vm/list   v1/virtualmachine/list   v2/vm/list
+v1/vm/info   v1/vm/snapshot/list      v1/kvm/vm/list
+```
+
+→ 中间层返回 `installed=false` 并列出探过的路径。**未实现** VM 启停 / 删除 / 快照回滚。
+
+---
+
+## 四之三、第四批踩坑（44~54）
+
+44. **`v1/user/online/list` 只吃 POST**：GET 返回 `9404`（"模块内路由不存在"），
+    容易误判成接口不存在。判断存在性必须 GET/POST 都试。
+45. **两个分页参数的基准相反**：`v1/user/online/list` 的 `page` **从 1 开始**，
+    `v1/log/query` 的 `page` **从 0 开始**（`cur_page` 回显同样 0 起）。
+    混用会静默错一页，不报错。
+46. **会话里的 `host` 不是客户端 IP**：同一批 Web 会话 `host` 全相同（是接入时用的 NAS 侧地址），
+    `ip` 才是来源地址；SSH 会话两者相同。只展示 `host` 会看不到真实来源。
+47. **登录失败的审计级别是 `warning` 而不是 `error`**：`level` 只认 info/warning/critical，
+    传 `error` 直接 `8001 无效的输入参数`。中间层做了 `error→critical` 别名映射。
+48. **登录审计没有独立接口**，只能读 `log/query?module=login`；且 SSH 登录的账号只出现在正文里
+    （`operator=system`），只按 operator 过滤会漏。
+49. **备份任务列表把查询参数当 SQL 列名**：传未知字段报 `9999 … no such column: x`。
+    既是坑（乱传参数会 500 级失败），也是**枚举列名的手段**。
+50. **风扇 `mode` 枚举只有前端有**：后端只返回数字，1=静音 2=自动 3=全速 4=自定义，
+    来源是 `fanModal` 的预设数组，不在任何接口文档里。
+51. **`has_sys_fan` / `has_cpu_fan` 为 `false` 也可能有风扇**：本机两路转速都在报，
+    这两个标志不能当"有没有风扇"用。
+52. **`v1/hardware/fan/start` 是 GET 却是写操作**（改风扇模式），
+    别用 HTTP 方法判断危险等级；同样的还有容器启停。
+53. **电源计划没有独立端点**，藏在 `hardware/power/config` 里，和硬盘休眠策略共用一个接口。
+54. **未安装的应用整个模块都是 HTTP 404 非 JSON**（虚拟机），
+    与"模块已挂载但路由不存在"的 `9404` 可区分——这是判断"应用是否安装"最可靠的信号。

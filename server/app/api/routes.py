@@ -6,27 +6,39 @@ import time
 from fastapi import APIRouter, Body, Depends, HTTPException, Query, Request, status
 
 from ..services.alerts import AlertEngine
+from ..services.backup import BackupService
 from ..services.benchmark import BenchmarkManager, BenchmarkRejected
+from ..services.fans import FanService
 from ..services.health import HealthService
 from ..services.history import HistoryRecorder
 from ..services.images import ImageManager
+from ..services.logs import LogService
 from ..services.nas import NasService
 from ..services.power import DiskSleepMonitor
+from ..services.powerplan import PowerPlanService
 from ..services.push import PushService
+from ..services.sessions import SessionService
 from ..services.snapshot import build_overview, gather_snapshot
 from ..services.snapshots import SnapshotService
 from ..services.users import UserService
+from ..services.vms import VmService
 from .deps import (
     get_alerts,
+    get_backup,
     get_benchmark,
+    get_fans,
     get_health,
     get_history,
     get_images,
+    get_logs,
     get_nas,
+    get_power_plan,
     get_push,
+    get_sessions,
     get_sleep,
     get_snapshots,
     get_users,
+    get_vms,
     require_auth,
 )
 
@@ -126,6 +138,64 @@ async def shares(svc: UserService = Depends(get_users)):
     return ok(await svc.shares())
 
 
+# ------------------------------------------------------------------ 在线会话与登录审计
+
+@router.get("/sessions", dependencies=[Depends(require_auth)])
+async def sessions_overview(svc: SessionService = Depends(get_sessions)):
+    """在线会话 + 窗口内失败统计 + NAS 自带防爆破策略（一屏）。
+
+    来源 IP 属敏感信息：接口按用户自己的需要如实返回，文档与示例里一律用 192.0.2.10 占位。
+    """
+    return ok(await svc.overview())
+
+
+@router.get("/sessions/online", dependencies=[Depends(require_auth)])
+async def sessions_online(
+    page: int = Query(1, ge=1),
+    size: int = Query(50, ge=1, le=200),
+    svc: SessionService = Depends(get_sessions),
+):
+    """当前在线会话（`POST v1/user/online/list`）。
+
+    字段：用户名 / 来源 IP / 接入地址 / 登录时间 / 客户端平台 / 协议 / 连接时长。
+    支持踢下线的 `v1/user/online/stop` 存在但**不实现**（强制下线属高危操作）。
+    """
+    return ok(await svc.online(page, size))
+
+
+@router.get("/sessions/logins", dependencies=[Depends(require_auth)])
+async def sessions_logins(
+    page: int = Query(1, ge=1),
+    size: int = Query(50, ge=1, le=200),
+    only_failed: bool = False,
+    user: str = "",
+    since: int | None = Query(None, description="Unix 秒，含"),
+    until: int | None = Query(None, description="Unix 秒，含"),
+    svc: SessionService = Depends(get_sessions),
+):
+    """登录审计日志（成功 / 失败 / 来源 IP / 方式），支持分页与只看失败。
+
+    数据来自 `v1/log/query?module=login`：成功是 info、密码错误是 warning，
+    所以 `only_failed=true` 用服务端级别过滤，分页 total 与筛选结果一致。
+    """
+    return ok(await svc.logins(page, size, only_failed, user, since, until))
+
+
+@router.get("/sessions/failures", dependencies=[Depends(require_auth)])
+async def sessions_failures(
+    window: int = Query(0, ge=0, le=86400, description="统计窗口秒数，0 = 用配置默认值"),
+    svc: SessionService = Depends(get_sessions),
+):
+    """窗口内按来源 IP 聚合的登录失败次数（告警规则的数据源）。"""
+    return ok(await svc.failures(window or None))
+
+
+@router.get("/security/faillock", dependencies=[Depends(require_auth)])
+async def security_faillock(svc: SessionService = Depends(get_sessions)):
+    """NAS 自带的失败锁定策略与黑名单（只读，中间层不修改）。"""
+    return ok(await svc.faillock())
+
+
 # ------------------------------------------------------------------ 网络
 
 @router.get("/network/interfaces", dependencies=[Depends(require_auth)])
@@ -222,6 +292,29 @@ async def disk_sleep(
         a.to_dict() for a in alerts.active() if a.key.startswith("disk_wake_freq:")
     ]
     return ok(data)
+
+
+# ------------------------------------------------------------------ 风扇 / 电源计划（只读）
+
+@router.get("/fans", dependencies=[Depends(require_auth)])
+async def fans(svc: FanService = Depends(get_fans)):
+    """风扇转速与策略模式（只读）。
+
+    转速来自 `stat/overview` 的 `cpu_fan` / `device_fan`；模式来自 `v1/hardware/fan/config`
+    （1=静音 2=自动 3=全速 4=自定义）。目标转速没有接口暴露，`target_rpm.supported=false`。
+    **调速接口存在但中间层不实现**（改策略可能损伤硬件）。
+    """
+    return ok(await svc.status())
+
+
+@router.get("/power/plan", dependencies=[Depends(require_auth)])
+async def power_plan(svc: PowerPlanService = Depends(get_power_plan)):
+    """定时开关机计划（只读）。
+
+    计划表不在独立接口里，而在 `v1/hardware/power/config` 的 `time_switches`。
+    不给写接口：误改计划会让 NAS 不按预期启停。
+    """
+    return ok(await svc.plan())
 
 
 # ------------------------------------------------------------------ 磁盘 SMART / 测速
@@ -534,12 +627,31 @@ async def snapshot_restore(
 async def logs(
     page: int = Query(1, ge=1),
     size: int = Query(50, ge=1, le=500),
-    level: str = "",
+    level: list[str] = Query(default=[], description="可重复；info/warning/critical（error 映射为 critical）"),
     module: str = "",
     keyword: str = "",
-    nas: NasService = Depends(get_nas),
+    since: int | None = Query(None, description="起始时间，Unix 秒"),
+    until: int | None = Query(None, description="结束时间，Unix 秒"),
+    order: str = Query("down", pattern="^(up|down)$"),
+    order_param: str = Query("create_time", pattern="^(create_time|level|module|operator)$"),
+    svc: LogService = Depends(get_logs),
 ):
-    return ok(await nas.logs(page, size, level, module, keyword))
+    """系统日志：按级别 / 模块 / 关键词 / 时间范围过滤，支持分页与排序。
+
+    实测：NAS 侧 `page` 从 0 开始（对外统一 1 起）；`size` 最大实测 500；
+    `level` 只认 info/warning/critical，传 error 会 `8001 无效的输入参数`，这里已做别名映射。
+    """
+    try:
+        return ok(await svc.query(page, size, level, module, keyword, since, until,
+                                 order, order_param))
+    except ValueError as exc:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+
+
+@router.get("/logs/meta", dependencies=[Depends(require_auth)])
+async def logs_meta(svc: LogService = Depends(get_logs)):
+    """日志筛选项：可用级别 / 模块 / 操作者（来自 `v1/log/usersandmodules`）。"""
+    return ok(await svc.meta())
 
 
 # ------------------------------------------------------------------ 任务管理器
@@ -575,6 +687,46 @@ async def services_health(
     return ok(data)
 
 
+# ------------------------------------------------------------------ 备份 / 同步任务（只读）
+
+@router.get("/backup/tasks", dependencies=[Depends(require_auth)])
+async def backup_tasks(svc: BackupService = Depends(get_backup)):
+    """同步与备份任务列表：名称 / 类型 / 状态 / 进度 / 上次与下次运行时间。
+
+    本机没有配置任务，`schema_verified=false` 表示条目字段名只能按前端归一化逻辑推断；
+    每个条目都带 `raw` 供客户端兜底。只读，不提供创建 / 删除 / 立即执行。
+    """
+    return ok(await svc.tasks())
+
+
+@router.get("/backup/failures", dependencies=[Depends(require_auth)])
+async def backup_failures(svc: BackupService = Depends(get_backup)):
+    """最近失败的备份任务 + NAS 侧备份告警横幅。"""
+    return ok(await svc.failures())
+
+
+@router.get("/backup/runs", dependencies=[Depends(require_auth)])
+async def backup_runs(
+    page: int = Query(1, ge=1),
+    size: int = Query(20, ge=1, le=200),
+    svc: BackupService = Depends(get_backup),
+):
+    """备份执行历史（`v1/web/sync/log/task/list`）。本机无任务，故为空。"""
+    return ok(await svc.runs(page, size))
+
+
+# ------------------------------------------------------------------ 虚拟机（只读）
+
+@router.get("/vms", dependencies=[Depends(require_auth)])
+async def vms(svc: VmService = Depends(get_vms)):
+    """KVM 虚拟机列表（只读）。
+
+    先查 `desktop/module/list` 判断是否安装虚拟机应用；未安装时 `installed=false`
+    并说明探测过的路径。VM 启停 / 删除 / 快照回滚一律不实现。
+    """
+    return ok(await svc.status())
+
+
 @router.get("/alerts", dependencies=[Depends(require_auth)])
 async def alerts_list(alerts: AlertEngine = Depends(get_alerts)):
     return ok(
@@ -606,9 +758,11 @@ async def suppress_container(
 @router.post("/alerts/poll", dependencies=[Depends(require_auth)])
 async def poll_now(alerts: AlertEngine = Depends(get_alerts), nas: NasService = Depends(get_nas),
                    push: PushService = Depends(get_push),
-                   health: HealthService = Depends(get_health)):
+                   health: HealthService = Depends(get_health),
+                   sessions: SessionService = Depends(get_sessions),
+                   backup: BackupService = Depends(get_backup)):
     """手动触发一次巡检，便于联调。"""
-    snapshot = await gather_snapshot(nas, health)
+    snapshot = await gather_snapshot(nas, health, sessions, backup)
     events = await alerts.evaluate(snapshot)
     pushed = 0
     for ev in events:
@@ -680,6 +834,22 @@ async def alert_rules(request: Request, alerts: AlertEngine = Depends(get_alerts
                  "window_seconds": s.alert_nic_error_window,
                  "available": False,
                  "reason": "UGOS 未暴露网口错误包/丢弃包计数，规则逻辑保留但不会触发"},
+                # --- 第四批 ---
+                {"key": "login_bruteforce", "level": "warning",
+                 "threshold": s.alert_login_fail_count,
+                 "window_seconds": s.alert_login_fail_window,
+                 "unit": "次/IP", "available": True,
+                 "critical_at": s.alert_login_fail_count * 2,
+                 "note": "数据源 v1/log/query?module=login（不看 level=info 的成功记录）；"
+                         "NAS 自带 faillock 更严格，建议告警阈值不高于它"},
+                {"key": "backup_task_failed", "level": "warning",
+                 "threshold": None, "available": True,
+                 "note": "任务状态位=失败即告警；本机未配置任务，用合成数据验证状态机"},
+                {"key": "backup_task_stale", "level": "warning",
+                 "threshold": s.alert_backup_stale_hours, "unit": "小时",
+                 "available": True,
+                 "note": "优先用上次运行时间；取不到时退回「状态未开始/等待中但计划时间已过」；"
+                         "两条证据都没有则静默跳过"},
             ],
             "summary": alerts.summary(),
         }

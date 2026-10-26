@@ -11,20 +11,27 @@ from .nas import NasService
 log = logging.getLogger("snapshot")
 
 
-async def gather_snapshot(nas: NasService, health=None) -> dict:
+async def gather_snapshot(nas: NasService, health=None, sessions=None, backup=None) -> dict:
     """并发拉取，单个数据源失败不影响其它（该字段降级为空）。
 
     `health` 传入时会额外带上服务健康快照（UGOS 服务 + 系统进程 + Docker 引擎），
     供 `service_down` 规则使用；不传则跳过（总览等场景不需要）。
+    `sessions` / `backup` 同理：传入才拉登录失败统计与备份任务列表。
     """
     calls = [nas.system(), nas.live(), nas.storage(), nas.containers(), nas.all_smart()]
     names = ["system", "live", "storage", "containers", "smart"]
     if health is not None:
         calls.append(health.services())
         names.append("service_health")
+    if sessions is not None:
+        calls.append(sessions.failures())
+        names.append("login_failures")
+    if backup is not None:
+        calls.append(backup.tasks())
+        names.append("backup")
 
     results = await asyncio.gather(*calls, return_exceptions=True)
-    empty = {"containers": [], "smart": []}
+    empty = {"containers": [], "smart": [], "login_failures": {}, "backup": {}}
     snapshot: dict = {}
     for name, value in zip(names, results):
         if isinstance(value, BaseException):

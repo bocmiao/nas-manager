@@ -5,15 +5,21 @@ from fastapi import Request
 
 from ..security import verify_token
 from ..services.alerts import AlertEngine
+from ..services.backup import BackupService
 from ..services.benchmark import BenchmarkManager
+from ..services.fans import FanService
 from ..services.health import HealthService
 from ..services.history import HistoryRecorder
 from ..services.images import ImageManager
+from ..services.logs import LogService
 from ..services.nas import NasService
 from ..services.power import DiskSleepMonitor
+from ..services.powerplan import PowerPlanService
 from ..services.push import PushService
+from ..services.sessions import SessionService
 from ..services.snapshots import SnapshotService
 from ..services.users import UserService
+from ..services.vms import VmService
 
 
 def require_auth(request: Request) -> None:
@@ -58,3 +64,27 @@ def get_health(request: Request) -> HealthService:
 
 def get_sleep(request: Request) -> DiskSleepMonitor:
     return request.app.state.disk_sleep
+
+
+def get_logs(request: Request) -> LogService:
+    return request.app.state.logs
+
+
+def get_sessions(request: Request) -> SessionService:
+    return request.app.state.sessions
+
+
+def get_fans(request: Request) -> FanService:
+    return request.app.state.fans
+
+
+def get_backup(request: Request) -> BackupService:
+    return request.app.state.backup
+
+
+def get_power_plan(request: Request) -> PowerPlanService:
+    return request.app.state.power_plan
+
+
+def get_vms(request: Request) -> VmService:
+    return request.app.state.vms

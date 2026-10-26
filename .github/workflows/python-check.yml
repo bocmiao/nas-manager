@@ -1,0 +1,70 @@
+name: Python Check
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'server/**'
+      - 'scripts/**'
+      - '.github/workflows/python-check.yml'
+  pull_request:
+    paths:
+      - 'server/**'
+      - 'scripts/**'
+  workflow_dispatch:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    env:
+      # 占位配置：让 Settings 能初始化，测试本身用合成数据，不连 NAS
+      UGOS_HOST: 192.0.2.10
+      UGOS_PORT: "9443"
+      UGOS_USER: ci-placeholder
+      UGOS_PASSWORD: ci-placeholder
+      API_TOKEN: ci-placeholder-token
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: server/requirements.txt
+
+      - name: 安装依赖
+        run: pip install -r server/requirements.txt
+
+      - name: 语法编译检查
+        run: python -m compileall -q server/app scripts
+
+      - name: 应用装配冒烟（不发起网络请求）
+        working-directory: server
+        run: python -c "from app.main import app; print('routes:', len(app.routes))"
+
+      - name: 告警规则与解析测试
+        working-directory: server
+        run: |
+          set -e
+          for t in ../scripts/test_alerts_batch3.py ../scripts/test_alerts_batch4.py; do
+            if [ -f "$t" ]; then
+              echo "==> $t"
+              python "$t"
+            fi
+          done
+
+      - name: 脱敏检查（public 仓库不得出现真实设备信息）
+        run: |
+          set +e
+          HITS=$(grep -rnIE '10\.168\.|192\.168\.|DXP4800PLUS-[0-9]|WD-WX[0-9A-Z]{6,}' \
+            --include='*.py' --include='*.swift' --include='*.md' --include='*.yml' \
+            --exclude-dir=.git --exclude-dir=.probe . 2>/dev/null)
+          if [ -n "$HITS" ]; then
+            echo "发现疑似真实设备信息："
+            echo "$HITS"
+            exit 1
+          fi
+          echo "脱敏检查通过"

@@ -19,16 +19,22 @@ from .cache import TTLCache
 from .config import get_settings
 from .security import RateLimiter
 from .services.alerts import AlertEngine
+from .services.backup import BackupService
 from .services.benchmark import BenchmarkManager
+from .services.fans import FanService
 from .services.health import HealthService
 from .services.history import HistoryRecorder
 from .services.images import ImageManager
+from .services.logs import LogService
 from .services.nas import NasService
 from .services.power import DiskSleepMonitor
+from .services.powerplan import PowerPlanService
 from .services.push import PushService
+from .services.sessions import SessionService
 from .services.snapshot import gather_snapshot
 from .services.snapshots import SnapshotService
 from .services.users import UserService
+from .services.vms import VmService
 from .ugos.client import UgosAuthRequired, UgosClient, UgosError
 
 log = logging.getLogger("main")
@@ -63,6 +69,12 @@ async def lifespan(app: FastAPI):
     app.state.history = HistoryRecorder(app.state.nas, settings)
     app.state.users = UserService(app.state.nas, app.state.cache, settings)
     app.state.health = HealthService(app.state.nas, settings)
+    app.state.logs = LogService(app.state.nas, app.state.cache, settings)
+    app.state.sessions = SessionService(app.state.nas, app.state.cache, settings, app.state.logs)
+    app.state.fans = FanService(app.state.nas, app.state.cache, settings)
+    app.state.backup = BackupService(app.state.nas, app.state.cache, settings)
+    app.state.power_plan = PowerPlanService(app.state.nas, settings)
+    app.state.vms = VmService(app.state.nas, app.state.cache, settings)
     app.state.ugos_reachable = False
     app.state.last_poll_ok = False
     app.state.last_poll_at = 0
@@ -93,7 +105,9 @@ async def lifespan(app: FastAPI):
     async def poller() -> None:
         while True:
             try:
-                snapshot = await gather_snapshot(app.state.nas, app.state.health)
+                snapshot = await gather_snapshot(
+                    app.state.nas, app.state.health, app.state.sessions, app.state.backup
+                )
                 events = await app.state.alerts.evaluate(snapshot)
                 app.state.ugos_reachable = True
                 app.state.last_poll_ok = True

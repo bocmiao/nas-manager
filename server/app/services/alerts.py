@@ -21,6 +21,48 @@ log = logging.getLogger("alerts")
 
 LEVEL_ORDER = {"info": 0, "warning": 1, "critical": 2}
 
+# 数据源 → 受它影响的告警键前缀。
+# 某数据源本轮降级（取不到）时，属于它的告警既不新增也不恢复：
+# 「取不到数据」不等于「故障消失」，否则 NAS 一抖动就会刷出一堆 resolved 再 raised。
+DEGRADED_KEY_PREFIXES = {
+    "storage": (
+        "disk_temp:", "disk_status:", "pool_status:", "pool_no_redundancy:",
+        "volume_used:", "volume_inode:", "disk_wake_freq:",
+    ),
+    "live": ("cpu_temp", "cpu_used", "mem_used", "fan_stall:"),
+    "system": ("nic_speed:", "nic_errors:", "ups_on_battery"),
+    "smart": ("disk_smart:", "disk_smart_crc:"),
+    "containers": ("container_down:", "container_restart_loop:", "container_expected_down:"),
+    "service_health": ("service_down:",),
+    "login_failures": ("login_bruteforce:",),
+    "backup": ("backup_task_failed:", "backup_task_stale:"),
+}
+
+# 备份任务的计划时间格式未知（本机无真实任务），这里只做保守解析
+TIME_FORMATS = ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y/%m/%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S")
+
+
+def _parse_time(value) -> float | None:
+    """把任务里的时间字段解析成 Unix 秒；解析不出返回 None（调用方据此静默跳过）。"""
+    if isinstance(value, (int, float)) and value > 0:
+        return float(value)
+    if not isinstance(value, str) or not value.strip():
+        return None
+    text = value.strip()
+    for fmt in TIME_FORMATS:
+        try:
+            return time.mktime(time.strptime(text, fmt))
+        except ValueError:
+            continue
+    if len(text) == 5 and text[2] == ":":  # 只有 HH:MM
+        try:
+            hh, mm = int(text[:2]), int(text[3:])
+        except ValueError:
+            return None
+        now = time.localtime()
+        return time.mktime((now.tm_year, now.tm_mon, now.tm_mday, hh, mm, 0, 0, 0, -1))
+    return None
+
 
 @dataclass
 class Alert:
@@ -740,6 +782,114 @@ class AlertEngine:
             )
         return found
 
+    # ---------------------------------------------------------------- 登录失败
+
+    def _check_login_failures(self, failures: dict | None, now: float) -> dict[str, Alert]:
+        """同一来源 IP 在窗口内登录失败次数达阈值。
+
+        数据来自审计日志（`v1/log/query?module=login` + 级别过滤），本身就是"过去 N 分钟"的
+        滑动窗口统计，所以不需要像相对量规则那样首轮建基线 —— 窗口里没有失败记录就不会报。
+        """
+        if not isinstance(failures, dict):
+            return {}
+        threshold = self._s.alert_login_fail_count
+        if threshold <= 0:
+            return {}
+        window = int(failures.get("window_seconds") or self._s.alert_login_fail_window)
+        found: dict[str, Alert] = {}
+        for node in failures.get("items") or []:
+            count = node.get("count") or 0
+            if count < threshold:
+                continue
+            ip = node.get("ip") or "unknown"
+            key = f"login_bruteforce:{ip}"
+            users = "、".join(node.get("users") or []) or "未知账号"
+            last_at = node.get("last_at")
+            found[key] = Alert(
+                key=key,
+                scope="security",
+                level="critical" if count >= threshold * 2 else "warning",
+                title=f"来源 {ip} 登录失败次数异常",
+                detail=(
+                    f"{window // 60} 分钟内失败 {count} 次（阈值 {threshold}），"
+                    f"涉及账号：{users}"
+                    + (f"，最近一次 {time.strftime('%H:%M:%S', time.localtime(last_at))}" if last_at else "")
+                ),
+                value=float(count),
+                threshold=float(threshold),
+                since=now,
+            )
+        return found
+
+    # ---------------------------------------------------------------- 备份任务
+
+    def _check_backup(self, backup: dict | None, now: float) -> dict[str, Alert]:
+        """备份任务失败 / 超期未运行。
+
+        - 失败：任务状态位 = 失败（枚举 1 / 字符串 error）即告警，绝对判定。
+        - 超期：优先用任务的上次运行时间；拿不到时退回「状态仍是未开始/等待中但计划时间已过」。
+          两条证据都没有就静默跳过，不自造 last_run。
+        """
+        if not isinstance(backup, dict):
+            return {}
+        found: dict[str, Alert] = {}
+        stale_hours = self._s.alert_backup_stale_hours
+        for task in backup.get("items") or []:
+            if not isinstance(task, dict):
+                continue
+            tid = task.get("id")
+            name = task.get("name") or f"task-{tid}"
+            if task.get("failed"):
+                key = f"backup_task_failed:{tid}"
+                found[key] = Alert(
+                    key=key,
+                    scope="backup",
+                    level="warning",
+                    title=f"备份任务失败：{name}",
+                    detail=(
+                        f"状态 {task.get('status_label') or task.get('status')}"
+                        f"，类型 {task.get('protocol') or '未知'}"
+                        f"，进度 {task.get('progress')}%"
+                    ),
+                    value=float(task.get("status_code") or 0),
+                    since=now,
+                )
+                continue  # 已失败的任务不再叠加超期告警
+
+            if stale_hours <= 0:
+                continue
+            limit = stale_hours * 3600
+            last = task.get("last_run_at")
+            overdue_by = None
+            basis = None
+            if isinstance(last, (int, float)) and last > 0:
+                if now - last > limit:
+                    overdue_by = now - last
+                    basis = "上次运行时间"
+            elif task.get("status_code") in (5, 6):
+                planned = _parse_time(task.get("schedule_time"))
+                if planned and now - planned > limit:
+                    overdue_by = now - planned
+                    basis = "计划时间"
+            if overdue_by is None:
+                continue
+            key = f"backup_task_stale:{tid}"
+            found[key] = Alert(
+                key=key,
+                scope="backup",
+                level="warning",
+                title=f"备份任务超期未运行：{name}",
+                detail=(
+                    f"按{basis}推算已 {overdue_by / 3600:.1f} 小时没有成功运行"
+                    f"（阈值 {stale_hours:g} 小时），当前状态 "
+                    f"{task.get('status_label') or task.get('status')}"
+                ),
+                value=round(overdue_by / 3600, 1),
+                threshold=float(stale_hours),
+                since=now,
+            )
+        return found
+
     # ---------------------------------------------------------------- 状态机
 
     async def evaluate(self, snapshot: dict) -> list[AlertEvent]:
@@ -759,6 +909,10 @@ class AlertEngine:
             found.update(self._evaluate_services(snapshot, now))
             found.update(self._check_disk_wakes(disks, now))
 
+            # 第四批：登录失败与备份任务（数据源为空时自然不产生告警）
+            found.update(self._check_login_failures(snapshot.get("login_failures"), now))
+            found.update(self._check_backup(snapshot.get("backup"), now))
+
             events: list[AlertEvent] = []
 
             for key, alert in found.items():
@@ -773,7 +927,16 @@ class AlertEngine:
                     existing.detail = alert.detail
                     existing.level = alert.level
 
-            for key in [k for k in self._active if k not in found]:
+            # 降级的那些数据源，本轮既不新增也不恢复
+            skipped = tuple(
+                prefix
+                for src in (snapshot.get("degraded") or [])
+                for prefix in DEGRADED_KEY_PREFIXES.get(src, ())
+            )
+            for key in [
+                k for k in self._active
+                if k not in found and not (skipped and k.startswith(skipped))
+            ]:
                 alert = self._active.pop(key)
                 events.append(AlertEvent("resolved", alert))
                 log.info("告警恢复：%s", alert.title)
