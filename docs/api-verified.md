@@ -1195,3 +1195,35 @@ v1/vm/info   v1/vm/snapshot/list      v1/kvm/vm/list
 | `ios/NasManager/Core/FileService.swift` | `compress` / `isEncryptedArchive` / `extract` + `waitForArchive()` 轮询落地 |
 | `ios/NasManager/Views/FilesView.swift` | 菜单「压缩成 ZIP」/「解压到同名目录」，加密包弹密码输入框 |
 | `scripts/probe_archive.py` | 真机闭环探针（建沙盒 → 压 → 解 → 校验 → 全删） |
+
+## 四之十一、文件夹体积（93，2026-10-26 实测）
+
+93. **`GET v2/filemgr/getSizeAndCount` 必须带 `intranet_share_id`**。
+
+    | 请求 | 返回 |
+    |---|---|
+    | `?path=/volume1/docker` | `{size: 0, file_count: 0, dir_count: 0, status: 0, calculate_id: "..."}` |
+    | `?path=/volume1/docker&intranet_share_id=0` | `{size: 749719225, takes_space: 754683904, file_count: 2099, dir_count: 310, ...}` |
+    | `?paths=["/volume1/docker"]` | `9999 操作失败!` |
+
+    只传 `path` 看着"成功"，实际所有数字都是 0，像空目录——**这是最容易误判的坑**。
+
+    另外**计算是增量的**：同一个目录连打 3 次，`size` 从 749MB →
+    1.35GB → 1.35GB，`file_count` 从 2099 → 2690 → 2737。
+
+    `status` 一直返回 `0`，**没有明确的「算完了」标志**。
+    所以客户端只能连续采样到数字不再变化。大目录别指望一次就准。
+
+    字段含义：`size` 逻辑大小，`takes_space` 实际占用（含块对齐），
+    `file_count` / `dir_count` 文件与子目录数，`calculate_id` 是这次计算的 id
+    （`delSizeAndCount` 用来取消，未验证）。
+
+### 落地
+
+| 位置 | 做了什么 |
+|---|---|
+| `server/app/services/files.py` | `folder_size()`：强制带 `intranet_share_id` |
+| `server/app/api/routes.py` | `GET /files/size` |
+| `ios/NasManager/Core/FileService.swift` | `folderSize()` + `measureFolder()`（采样到稳定） |
+| `ios/NasManager/Views/FileInfoSheet.swift` | 条目详情：目录现算体积，算的过程中显示「正在计算…」 |
+| `scripts/probe_folder_size.py` | 6 种载荷形状逐一试，确认只有带 `intranet_share_id` 才真算 |
