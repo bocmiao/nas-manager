@@ -12,7 +12,9 @@ final class ContainerBrowserCoordinator: NSObject, WKNavigationDelegate, WKUIDel
     private weak var state: ContainerBrowserState?
     private var nasHost: String = ""
     private var observations: [NSKeyValueObservation] = []
-    private var downloadDestinations: [WKDownload: URL] = [:]
+    /// 下载目标的临时落点。放在这里而不是下载扩展文件里，是因为它在
+    /// `decideDestinationUsing` 里写入、在 `downloadDidFinish` 里读出，跨 extension。
+    var downloadDestinations: [WKDownload: URL] = [:]
 
     func attach(webView: WKWebView, state: ContainerBrowserState, nasHost: String) {
         self.state = state
@@ -43,7 +45,9 @@ final class ContainerBrowserCoordinator: NSObject, WKNavigationDelegate, WKUIDel
         ]
     }
 
-    private func publish(_ mutate: @escaping (ContainerBrowserState) -> Void) {
+    /// 主线程发布状态变更。`internal` 是因为 JS 弹窗、下载等回调分散在同 module
+    /// 的多个 extension 文件里，`private` 跨不了文件。
+    func publish(_ mutate: @escaping (ContainerBrowserState) -> Void) {
         let apply = { [weak self] in
             guard let state = self?.state else { return }
             mutate(state)
