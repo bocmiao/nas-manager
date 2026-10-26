@@ -78,9 +78,15 @@ async def main() -> None:
     await c.login()
     print("登录成功")
 
-    # A) 个人文件夹根
-    home = await post(c, "v2/filemgr/getDirFileListV2", list_body("/home/<user>"))
-    home_files = show(home, "path=/home/<user>")
+    # A) 个人文件夹根 —— 家目录路径含账号名，不在脚本里写死，
+    #    先用 root_type=2 让 NAS 自己报出 top_path，再按该路径往下钻
+    home = await post(c, "v2/filemgr/getDirFileListV2", list_body(None, root_type=2))
+    home_files = show(home, "root_type=2 (个人文件夹)")
+    home_path = ((home.get("data") or {}).get("right_files") or {}).get("top_path") or ""
+    if home_path:
+        print(f"  家目录 top_path = {home_path}")
+        home = await post(c, "v2/filemgr/getDirFileListV2", list_body(home_path))
+        home_files = show(home, f"path={home_path}") or home_files
     dump("home", home)
 
     # B) 钻进第一个子目录，看真实文件与 file_type
@@ -141,7 +147,8 @@ async def main() -> None:
                     break
 
     # E) 空间查询
-    free = await post(c, "v1/filemgr/getPathFreeSize", {"path": "/home/<user>"})
+    if home_path:
+        free = await post(c, "v1/filemgr/getPathFreeSize", {"path": home_path})
     print(f"\n空间: {json.dumps(free, ensure_ascii=False)[:300]}")
 
     await c.close()
