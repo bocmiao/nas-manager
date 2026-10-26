@@ -46,7 +46,7 @@ enum FileSort: String, CaseIterable, Identifiable {
 // MARK: - 根分类
 
 /// 根分类。`root_type` 是 NAS 的数字编号，只有本机真实存在的那些会被返回。
-struct FileCategory: Codable, Identifiable, Hashable {
+struct FileCategory: Decodable, Identifiable, Hashable {
     let rootType: Int
     let key: String
     let name: String
@@ -77,7 +77,7 @@ struct FileCategory: Codable, Identifiable, Hashable {
 
 // MARK: - 卷
 
-struct FileVolume: Codable, Identifiable, Hashable {
+struct FileVolume: Decodable, Identifiable, Hashable {
     let name: String
     let path: String?
     let fsType: String?
@@ -121,7 +121,7 @@ struct FileVolume: Codable, Identifiable, Hashable {
 
 // MARK: - 根信息
 
-struct FileRoots: Codable, Hashable {
+struct FileRoots: Decodable, Hashable {
     let categories: [FileCategory]
     let volumes: [FileVolume]
 }
@@ -132,7 +132,7 @@ struct FileRoots: Codable, Hashable {
 ///
 /// 判定规则以实测为准：`is_dir` 是目录的唯一依据（缺字段时退回 `file_type == 1`），
 /// `is_tag` 的条目是「标签」而不是文件——既不能下载也不能删除。
-struct FileEntry: Codable, Identifiable, Hashable {
+struct FileEntry: Decodable, Identifiable, Hashable {
     let name: String
     let path: String
     let isDir: Bool
@@ -203,7 +203,7 @@ struct FileEntry: Codable, Identifiable, Hashable {
         case mount
     }
 
-    struct MountInfo: Codable {
+    struct MountInfo: Decodable {
         let isMount: Bool?
 
         enum CodingKeys: String, CodingKey {
@@ -277,7 +277,7 @@ struct FileEntry: Codable, Identifiable, Hashable {
 
 // MARK: - 目录列表
 
-struct FileListing: Codable, Hashable {
+struct FileListing: Decodable, Hashable {
     let path: String?
     let rootType: Int?
     /// 树根，**不是**当前目录；面包屑由视图自己维护的栈负责
@@ -308,7 +308,7 @@ struct FileListing: Codable, Hashable {
 
 // MARK: - 剩余空间 / 删除结果
 
-struct FileSpace: Codable, Hashable {
+struct FileSpace: Decodable, Hashable {
     let path: String
     let free: UInt64?
 
@@ -331,7 +331,7 @@ struct FileSpace: Codable, Hashable {
     }
 }
 
-struct FileDeleteResult: Codable, Hashable {
+struct FileDeleteResult: Decodable, Hashable {
     var deleted: [String]
     var forever: Bool
 }
@@ -431,58 +431,77 @@ struct FileVolumePayload: Decodable {
 /// NAS 同一字段在不同固件里可能是 Int / String / Double，逐个试，取不到就 nil。
 /// 缺字段或类型不符都不能让整份解码失败。
 private enum Lenient {
+    /// 注意：`try? c.decodeIfPresent(T.self, forKey:)` 的双重 Optional 会被 Swift 展平，
+    /// `if let` 拿到的是**非** Optional 的 T，所以不能写 `.map`。
+    /// 统一用「显式类型标注 + `?? nil`」把两层都摊平，任何固件下都不会解崩。
     static func string<K: CodingKey>(_ c: KeyedDecodingContainer<K>, _ key: K) -> String? {
-        if let value = try? c.decodeIfPresent(String.self, forKey: key) {
-            let trimmed = value?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if let value: String = (try? c.decodeIfPresent(String.self, forKey: key)) ?? nil {
+            let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
             return trimmed.isEmpty ? nil : trimmed
         }
-        if let value = try? c.decodeIfPresent(Int.self, forKey: key) { return value.map { String($0) } }
-        if let value = try? c.decodeIfPresent(Double.self, forKey: key) { return value.map { String(Int($0)) } }
+        if let value: Int = (try? c.decodeIfPresent(Int.self, forKey: key)) ?? nil {
+            return String(value)
+        }
+        if let value: Double = (try? c.decodeIfPresent(Double.self, forKey: key)) ?? nil {
+            return String(Int(value))
+        }
         return nil
     }
 
     static func int<K: CodingKey>(_ c: KeyedDecodingContainer<K>, _ key: K) -> Int? {
-        if let value = try? c.decodeIfPresent(Int.self, forKey: key) { return value }
-        if let value = try? c.decodeIfPresent(String.self, forKey: key) {
-            return value.flatMap { Int($0.trimmingCharacters(in: .whitespaces)) }
+        if let value: Int = (try? c.decodeIfPresent(Int.self, forKey: key)) ?? nil {
+            return value
         }
-        if let value = try? c.decodeIfPresent(Double.self, forKey: key) { return value.map { Int($0) } }
+        if let value: String = (try? c.decodeIfPresent(String.self, forKey: key)) ?? nil {
+            return Int(value.trimmingCharacters(in: .whitespacesAndNewlines))
+        }
+        if let value: Double = (try? c.decodeIfPresent(Double.self, forKey: key)) ?? nil {
+            return Int(value)
+        }
         return nil
     }
 
     static func uint64<K: CodingKey>(_ c: KeyedDecodingContainer<K>, _ key: K) -> UInt64? {
-        if let value = try? c.decodeIfPresent(UInt64.self, forKey: key) { return value }
-        if let value = try? c.decodeIfPresent(Int.self, forKey: key) {
-            return value.flatMap { $0 >= 0 ? UInt64($0) : nil }
+        if let value: UInt64 = (try? c.decodeIfPresent(UInt64.self, forKey: key)) ?? nil {
+            return value
         }
-        if let value = try? c.decodeIfPresent(Double.self, forKey: key) {
-            return value.flatMap { $0 >= 0 ? UInt64($0) : nil }
+        if let value: Int = (try? c.decodeIfPresent(Int.self, forKey: key)) ?? nil {
+            return value >= 0 ? UInt64(value) : nil
         }
-        if let value = try? c.decodeIfPresent(String.self, forKey: key) {
-            return value.flatMap { UInt64($0.trimmingCharacters(in: .whitespaces)) }
+        if let value: Double = (try? c.decodeIfPresent(Double.self, forKey: key)) ?? nil {
+            return value >= 0 ? UInt64(value) : nil
+        }
+        if let value: String = (try? c.decodeIfPresent(String.self, forKey: key)) ?? nil {
+            return UInt64(value.trimmingCharacters(in: .whitespacesAndNewlines))
         }
         return nil
     }
 
     static func double<K: CodingKey>(_ c: KeyedDecodingContainer<K>, _ key: K) -> Double? {
-        if let value = try? c.decodeIfPresent(Double.self, forKey: key) { return value }
-        if let value = try? c.decodeIfPresent(Int.self, forKey: key) { return value.map { Double($0) } }
-        if let value = try? c.decodeIfPresent(String.self, forKey: key) {
-            return value.flatMap { Double($0.trimmingCharacters(in: .whitespaces)) }
+        if let value: Double = (try? c.decodeIfPresent(Double.self, forKey: key)) ?? nil {
+            return value
+        }
+        if let value: Int = (try? c.decodeIfPresent(Int.self, forKey: key)) ?? nil {
+            return Double(value)
+        }
+        if let value: String = (try? c.decodeIfPresent(String.self, forKey: key)) ?? nil {
+            return Double(value.trimmingCharacters(in: .whitespacesAndNewlines))
         }
         return nil
     }
 
     static func bool<K: CodingKey>(_ c: KeyedDecodingContainer<K>, _ key: K) -> Bool? {
-        if let value = try? c.decodeIfPresent(Bool.self, forKey: key) { return value }
-        if let value = try? c.decodeIfPresent(Int.self, forKey: key) { return value.map { $0 != 0 } }
-        if let value = try? c.decodeIfPresent(String.self, forKey: key) {
-            return value.flatMap { text -> Bool? in
-                switch text.lowercased() {
-                case "true", "1", "yes": return true
-                case "false", "0", "no": return false
-                default: return nil
-                }
+        if let value: Bool = (try? c.decodeIfPresent(Bool.self, forKey: key)) ?? nil {
+            return value
+        }
+        if let value: Int = (try? c.decodeIfPresent(Int.self, forKey: key)) ?? nil {
+            return value != 0
+        }
+        if let value: String = (try? c.decodeIfPresent(String.self, forKey: key)) ?? nil {
+            switch value.lowercased() {
+            case "true", "1", "yes": return true
+            case "false", "0", "no": return false
+            default: return nil
             }
         }
         return nil

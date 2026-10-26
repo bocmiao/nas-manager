@@ -95,9 +95,11 @@ def sanitize_path(path: str) -> str:
         raise FileRejected("path 含非法字符")
     if not path.startswith("/"):
         raise FileRejected("path 必须是绝对路径")
-    norm = posixpath.normpath(path)
-    if norm == ".." or norm.startswith("../") or "/../" in norm:
+    # 先按原始分段判 `..`，再归一化。反过来做的话 `/volume1/../etc` 会被 normpath
+    # 悄悄改写成 `/etc` 再转发出去——那等于帮调用方完成了一次路径逃逸。
+    if ".." in path.split("/"):
         raise FileRejected("path 不允许包含 ..")
+    norm = posixpath.normpath(path)
     if norm == "/":
         raise FileRejected("根目录请用 root_type 浏览，不要传 path=/")
     return norm

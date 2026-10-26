@@ -113,7 +113,9 @@ X-CurPass-Token: <RSA 加密后的账号密码>
 | 1024 | 会话过期，需重登 |
 | 1101 | 写操作密码验证失败（缺/错 `X-CurPass-Token`） |
 | 1300 | 没有权限访问（快照数据域，本机对任意 path 均如此） |
-| 1301 | 不允许访问（`filemgr/getDirFileList` 参数不完整时常见） |
+| 1301 | 不允许访问（**文件管理里最常见**：`path` 不在当前账号可见范围内，例如直接传卷根 `/volume1`；`getDirFileListV2` 参数不完整时也报这个） |
+| 499 | **文件不存在**（`downloadFile` 找不到路径时；HTTP 语义的码混在业务码里） |
+| 1327 | **存在同名文件夹**（`createFolder` 目标路径已存在） |
 | 2052 | 镜像名含非法字符（`DownloadImage` 字段名不对时也报这个） |
 | 5001 | 硬盘不存在（SMART/测速的 `disk` 参数值不对）；也用于**存储池不存在**（`pool/describe` 等参数名不对时） |
 | 9404 | **模块内路由不存在**（storage 等模块的兜底码，见踩坑 19） |
@@ -278,13 +280,92 @@ X-CurPass-Token: <RSA 加密后的账号密码>
 
 `ShowContainerDetailListV2` 的 `volumes` / `portMapping` 与上面同构，但 `nasPort` / `containerPort` 是**字符串**。
 
-### 文件管理
+### 文件管理（2026-10-26 全链路真机验证）
 
-| 方法 | 路径 | 返回要点 |
+`filemgr` 的接口面很大（前端 bundle 里能抓到 60+ 个 `v1/filemgr/*` 和 30+ 个 `v2/filemgr/*`），
+下面只列真正跑通的。探针脚本：`scripts/probe_files.py`、`scripts/probe_files2.py`。
+
+#### 根分类
+
+| 方法 | 路径 | 参数 | 返回 |
+|---|---|---|---|
+| GET | `v2/filemgr/getRootDirs` | `client=pc` | `{root_list: [2, 3, 4, 6, 9]}` —— **纯数字数组，没有对象** |
+| GET | `v1/filemgr/getVolumes` | — | `{result: [{name, path, fs_type, free, used, all, describe}]}` |
+| GET | `v1/filemgr/getSharedFolderList` | — | `{total, data: []}`（非管理员账号为空） |
+
+`root_list` 的数字与分类的对应来自前端 `initCache()` 的静态表：
+
+| root_type | 分类 | 本机 |
 |---|---|---|
-| POST | `v1/filemgr/getDirFileList` | 目录列表（GET 会 9404） |
-| GET | `v1/filemgr/getHomeFolderSet` | 家目录配置 |
-| — | `v2/filemgr/getDirFileListV2` / `getRootDirs` / `rename` | v2 新接口（1.19.1 存在） |
+| 1 | 收藏 | ✗ |
+| 2 | 个人文件夹 | ✓（`top_path=/home/<user>`） |
+| 3 | 共享文件夹 | ✓ |
+| 4 | 用户文件夹 | ✓ |
+| 5 | 远程挂载 | ✗ |
+| 6 | 外部设备 | ✓ |
+| 7 | 镜像（ISO） | ✗ |
+| 8 | 共享给我 | ✗ |
+| 9 | 标签 | ✓ |
+| 999999 | 搜索 | —（仅前端虚拟节点） |
+
+#### 目录列表
+
+`POST v2/filemgr/getDirFileListV2`
+
+| 字段 | 说明 |
+|---|---|
+| `root_type` | 根级用，整数 |
+| `path` | 子路径用，绝对路径字符串。**与 `root_type` 互斥** |
+| `permission` | 共享根（`root_type=3`）必须传 `4`，否则列不出来 |
+| `data_type` | `2`=只要右侧列表 / `1`=只要左树 / `0`=都要 |
+| `limit` / `page` | 分页，`page` 从 1 开始 |
+| `sort_type` | 1 名称 / 2 大小 / 3 类型 / 4 修改 / 5 创建 / 6 访问 / 7 删除时间 |
+| `reverse` | 升降序 |
+| `is_shield_recycle` / `left_no_page_show` / `left_count` / `intranet_share_id` / `version` / `operate` | 固定值：`false` / `false` / `5000` / `0` / `1` / `0` |
+
+返回：
+```json
+{"left_tree": {...}, "right_files": {"total": 11, "top_path": "/volume1/docker",
+  "permission_mask": 7, "files": [ {...条目...} ]}}
+```
+
+- `top_path` 是**这棵树的根**，不是当前目录（列 `/home/<user>/Music` 时它仍返回 `/home/<user>`）
+- 条目 `file_type`：**1 = 目录，0 = 文件**；条目约 30 个键，多数是前端内部状态
+- `root_type=9`（标签）返回的是**标签定义**（`tag_id` / `name` / `colour`），没有 `file_type`，
+  不应当成文件处理
+
+#### 下载（三步，缺一不可）
+
+| # | 方法 | 路径 | 参数 | 返回 |
+|---|---|---|---|---|
+| 1 | POST | `v2/filemgr/addPathsTask` | `{paths: [{path, intranet_share_id}]}` | `{result: "<task_uuid>"}` |
+| 2 | GET | `v2/filemgr/getDownloadToken` | `task_uuid` + `coding=true` + `is_livephoto=false` | `{dl_token}`（实测 32 字符） |
+| 3 | GET | `/ugreen/v2/filemgr/downloadFile` | `token=<dl_token>` | **原始字节**（带正确 `content-type`） |
+
+第 3 步用的是 `dl_token`，**不是会话 token**——前端同样关掉了 `tokenAuth`。
+服务端按 `chunked` 返回，**没有 `Content-Length`**。
+
+#### 写操作
+
+| 方法 | 路径 | 载荷 | 要点 |
+|---|---|---|---|
+| POST | `v2/filemgr/createFolder` | `{path: "<新目录完整路径>"}` | `path` 是**目标目录本身**不是父目录；已存在 → `1327` |
+| POST | `v2/filemgr/rename` | `{path, new_name}` | 返回更新后的条目（`path` 已变） |
+| POST | `v2/filemgr/delPaths` | `{paths: ["<路径字符串>"], forever: bool}` | **只认字符串数组**，传对象数组 → `9999 操作失败!` |
+| POST | `v1/filemgr/getPathFreeSize` | `{path}` | `{result: <bytes>}` |
+| GET | `v1/filemgr/determinePath` | `path` | 权限预检：`{result: null, code: 200}` 表示通过 |
+| GET | `v1/filemgr/queryReadable` | `path` | 可读性预检，`code == 200` 即可读 |
+
+`forever=false` 走回收站（与网页端默认一致），`true` 直删。
+
+#### 已知但未实现的 filemgr 能力
+
+前端 bundle 里还有这些接口，未做实测（按需再探）：
+`fileUpload` / `fileUploadV2`（上传，multipart + 临时文件两段式）、
+`getAllLevelsPath`（整树递归）、`createsearchtask` / `getsearchtaskresult`（异步搜索）、
+`cpOrMvPath`（复制/移动，`{dst, src, action_type, type, intranet_share_id}`）、
+`thumbnail` / `getIcon`（缩略图）、`compressedFile` / `unCompressedFile`（压缩解压）、
+`mountIso` / `umountIso`、`mvToVault`（保险箱）、`emptyRecycles`（清空回收站）。
 
 ### 用户与用户组（控制面板 `/ctlmgr`，2026-10-26 实测）
 
@@ -732,3 +813,41 @@ v1/vm/info   v1/vm/snapshot/list      v1/kvm/vm/list
 53. **电源计划没有独立端点**，藏在 `hardware/power/config` 里，和硬盘休眠策略共用一个接口。
 54. **未安装的应用整个模块都是 HTTP 404 非 JSON**（虚拟机），
     与"模块已挂载但路由不存在"的 `9404` 可区分——这是判断"应用是否安装"最可靠的信号。
+
+---
+
+## 四之四、文件管理踩坑（55~66，2026-10-26 实测）
+
+55. **`getRootDirs` 不返回对象，只返回数字**：`{root_list: [2,3,4,6,9]}`。
+    数字到分类名的映射（1 收藏 / 2 个人 / 3 共享 / 4 用户 / 5 远程 / 6 设备 / 7 镜像 /
+    8 分享给我 / 9 标签）只存在于前端 `initCache()` 里，任何接口都不返回。
+56. **根级用 `root_type`、子路径用 `path`，两者互斥**。
+    根级传 `path` 或不传参数都是 `1301`，容易误判成"没有权限"。
+57. **卷根路径是禁区**：传 `path=/volume1` 一定 `1301 不允许访问`。
+    账号能访问的最小单位是**共享文件夹根**（如 `/volume1/docker`）或家目录（`/home/<user>`）。
+    要拿卷级容量只能用 `getVolumes`，不能靠列目录。
+58. **共享文件夹根要额外传 `permission=4`**，否则返回空 `files`，且**不报错**。
+    对应前端逻辑 `category === COMMON && level === Level1 ? 4 : 0`。
+59. **`top_path` 是树的根，不是当前目录**。列 `/home/<user>/Music` 时它照样返回
+    `/home/<user>`。拿它当"我在哪"会导致面包屑永远停在最外层。
+60. **`file_type` 的 0 是"文件"不是"未知"**。标签根（`root_type=9`）返回的条目**根本没有**
+    `file_type`，用 `file_type === 0` 判断"是文件"会把标签当成可下载的文件。
+61. **下载令牌与会话令牌不通用**：第三步 `downloadFile` 只认 `dl_token`，
+    带会话 `token` 会失败。而这个端点**在 `ugreen/` 前缀下**，并且前端关掉了统一鉴权。
+62. **`createFolder` 的 `path` 是目标目录本身**，不是父目录。
+    传父目录不会报参数错，而是因为"目标已存在"返回 `1327 存在同名文件夹`——
+    看起来像"名字冲突"，实际是参数语义搞错了。
+63. **`delPaths` 的 `paths` 只能是字符串数组**。传条目对象数组返回 `9999 操作失败!`，
+    和"文件被占用"、"没有权限"的表现完全一样，极难定位。
+64. **下载不存在的文件返回业务码 `499`**（不是 404），且是在**第三步**才报，
+    前两步（建任务、换令牌）都会成功。所以不能靠第 1 步的结果判断文件是否存在。
+65. **HTTP 层没有 `Content-Length`**：下载响应是 chunked。
+    想在客户端做进度条只能用已下载字节数，不要指望 `expectedContentLength`。
+
+### 中间层踩坑（66）
+
+66. **流式转发必须在响应头发出之前判定上游状态**。
+    先 `return StreamingResponse(...)` 再在生成器里 `raise HTTPException`，
+    客户端拿到的是 `incomplete chunked read` / `peer closed connection`，而不是结构化错误。
+    正确做法是 `await ctx.__aenter__()` → 检查 `status_code` → 不合格就读完 body、
+    退出上下文、抛异常；合格才把已经进入的上下文交给生成器，`finally` 里退出。
